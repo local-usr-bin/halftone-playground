@@ -1,10 +1,10 @@
-"""Stripe mode (Round 1): variable-width stripe halftone core.
+"""Stripe mode (Round 2): variable-width stripe halftone core.
 
 The core idea, shared with the future Spiral mode, is that the *width* of a
 line is driven by the local grayscale of the source image, so that the
 black/white **area ratio** reproduces the perceived tone.
 
-Round 1 scope (deliberately small):
+Scope:
 
 * 2-D ``uint8`` grayscale input only;
 * a fixed stripe-center spacing ``period`` measured in output pixels;
@@ -15,6 +15,28 @@ Round 1 scope (deliberately small):
 Everything that turns that mask into a picture (black on white, inverted,
 colored, transparent, ...) belongs to a separate renderer layer and is *not*
 part of this module.  The mask never encodes color.
+
+Round 2 rasterization semantics
+--------------------------------
+
+Each cell first maps its mean gray to a continuous width
+
+    W_continuous = P * (1 - G)
+
+and then quantizes it to an explicit **integer line width**
+
+    N = floor(W_continuous + 0.5), clamped to [0, P]
+
+(half-up rounding, deliberately *not* Python's banker's ``round``).  A full
+cell must draw exactly ``N`` consecutive black pixels -- not "approximately
+N".  The integer block is positioned so that its geometric center
+``s + N/2`` (pixel ``x`` covering ``[x, x+1)`` with center ``x + 0.5``) is as
+close as possible to the continuous stripe center; an exact tie chooses the
+smaller start index (tie-left).  Odd ``N`` can therefore carry a fixed,
+deterministic bias of at most half a pixel -- no alternating, dithering or
+error diffusion is used.  Edge cells place the block on the nominal canvas
+first and clip afterwards, so a clipped edge cell may show *fewer* than ``N``
+black pixels and is never shifted inward.
 """
 
 from __future__ import annotations
@@ -57,12 +79,13 @@ def stripe_mask(gray: np.ndarray, period: int, angle_deg: float = 90.0) -> np.nd
 
     Notes
     -----
-    The algorithm works on *pixel centers*.  Output pixel ``x`` covers the
-    continuous interval ``[x, x + 1)`` and has center ``c = x + 0.5``.  A pixel
-    is part of a line only when its center ``c`` falls inside the continuous
-    line interval ``[center - W/2, center + W/2)``.  Deciding membership by
-    "does the pixel rectangle merely touch the line interval" would
-    systematically thicken thin lines, so it is deliberately avoided here.
+    Cell ownership is decided on *pixel centers*: output pixel ``x`` covers
+    the continuous interval ``[x, x + 1)`` and has center ``c = x + 0.5``.  A
+    pixel belongs to the cell whose continuous interval contains its center.
+    The line itself is an explicit integer-width block (see the module
+    docstring): ``N = floor(W + 0.5)`` consecutive pixels whose geometric
+    center is nearest to the continuous stripe center, ties to the smaller
+    start index.
     """
     _validate_inputs(gray, period, angle_deg)
 
@@ -111,7 +134,6 @@ def stripe_mask(gray: np.ndarray, period: int, angle_deg: float = 90.0) -> np.nd
         # enumeration no longer depends on the sign or the magnitude of
         # cot(theta) at all, so there is no special case for angles beyond 90
         # degrees.
-        k = -1
         left = phase - period_f
         while True:
             right = left + period_f
@@ -150,25 +172,51 @@ def stripe_mask(gray: np.ndarray, period: int, angle_deg: float = 90.0) -> np.nd
                 tone = mean_gray / 255.0
                 # Step 3: naive linear mapping.  W uses the nominal period P
                 # even for partial edge cells.
-                line_width = period_f * (1.0 - tone)
+                w_continuous = period_f * (1.0 - tone)
 
-                if line_width > 0.0:
+                # Step 4 (Round 2): quantize to an explicit integer line
+                # width.  Half-up rounding of the continuous width:
+                #     4.49 -> 4    4.50 -> 5    4.51 -> 5
+                # deliberately not Python's banker's round().  With G in
+                # [0, 1] the value is already inside [0, P]; the clamp keeps
+                # that guarantee explicit against floating-point residue.
+                line_width = int(math.floor(w_continuous + 0.5))
+                if line_width < 0:
+                    line_width = 0
+                elif line_width > period:
+                    line_width = period
+
+                if line_width > 0:
                     center = left + period_f * 0.5
-                    half_width = line_width * 0.5
-                    span_left = center - half_width
-                    span_right = center + half_width
 
-                    # The same pixel-center rule, now for the line interval:
-                    # pixel x is a line pixel iff span_left <= x + 0.5 < span_right.
-                    first_px = _snap_to_int(math.ceil(_snap(span_left - 0.5)))
-                    last_px = _snap_to_int(math.ceil(_snap(span_right - 0.5))) - 1
-                    first_px = max(0, first_px)
-                    last_px = min(width - 1, last_px)
-                    if first_px <= last_px:
-                        mask[y, first_px : last_px + 1] = True
+                    # Place the N-pixel block so that its geometric center
+                    # s + N/2 is nearest to the continuous stripe center.
+                    # The unconstrained optimum start is center - N/2; the
+                    # nearest integer s with ties resolved towards the
+                    # *smaller* index is
+                    #
+                    #     s = ceil(center - N/2 - 0.5)
+                    #
+                    # (ceil(d - 0.5) rounds d to nearest, half-down, which
+                    # is exactly tie-left for the block start.)  _snap absorbs
+                    # the representation residue around integer values so the
+                    # tie decision stays deterministic.
+                    start = _snap_to_int(
+                        math.ceil(_snap(center - line_width * 0.5 - 0.5))
+                    )
+                    stop = start + line_width
+
+                    # The block lives on the nominal canvas first and is only
+                    # then clipped to the real one: an edge cell may show
+                    # fewer than N visible black pixels, and the block is
+                    # never shifted inward, because that would move the
+                    # stripe center.
+                    lo = max(start, 0)
+                    hi = min(stop, width)
+                    if lo < hi:
+                        mask[y, lo:hi] = True
 
             left = right
-            k += 1
 
     return mask
 
@@ -176,13 +224,19 @@ def stripe_mask(gray: np.ndarray, period: int, angle_deg: float = 90.0) -> np.nd
 def _snap(value: float) -> float:
     """Snap a value that is within round-off of an integer onto that integer.
 
-    This is the *only* tolerance in the geometric pipeline.  It exists purely
-    to absorb the representation residue of ``x +/- 0.5`` (values like
-    ``7.999999999999999`` that stand for the integer 8), so that the exact
-    ``ceil`` formula above lands on the intended sheet of the integer lattice.
-    The bound is 1e-9, nine orders of magnitude below the 1 pixel quantization
-    step, and the distance to the nearest integer is kept so that a genuine
-    fractional boundary can never be dragged across an integer.
+    This is the *only* tolerance in the geometric pipeline, kept from Round 1.
+    It exists purely to absorb the representation residue of floating-point
+    arithmetic (values like ``7.999999999999999`` that stand for the integer
+    8), so that the exact ``ceil`` formulae land on the intended sheet of the
+    integer lattice.  Round 2 uses it in exactly two places: turning cell
+    boundaries into integer column indices, and turning the continuous block
+    start ``center - N/2 - 0.5`` into the integer block start -- the latter is
+    what keeps the tie-left rule deterministic, because without the snap a
+    mathematically exact tie could round ``up`` on one row and stay ``down``
+    on the next purely through representation noise.  The bound is 1e-9, nine
+    orders of magnitude below the 1 pixel quantization step, and the distance
+    to the nearest integer is kept so that a genuine fractional boundary can
+    never be dragged across an integer.
     """
     return round(value) if abs(value - round(value)) < 1e-9 else value
 
