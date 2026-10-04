@@ -121,9 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
-            "Variable-width line halftoning in two modes.  "
-            "Geometry produces a boolean mask from the source luminance; a "
-            "renderer turns that mask into pixels."
+            "Stripe and Spiral line halftoning with variable- or fixed-width "
+            "geometry and multiple render variants.  Geometry produces a "
+            "boolean mask; a renderer turns that mask into pixels."
         ),
         epilog=(
             "examples:\n"
