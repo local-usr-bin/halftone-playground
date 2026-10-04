@@ -23,8 +23,8 @@ from .render import (
     render_white_on_black,
 )
 from .smoke import GRADIENT_SIZE, make_gradient, save_gray_png
-from .spiral import spiral_mask
-from .stripe import stripe_mask
+from .spiral import spiral_fixed_mask, spiral_mask
+from .stripe import stripe_fixed_mask, stripe_mask
 
 __version__ = "0.0.1"
 
@@ -39,6 +39,8 @@ __all__ = [
     "resize_rgb",
     "save_gray_png",
     "scaled_size",
+    "spiral_fixed_mask",
     "spiral_mask",
+    "stripe_fixed_mask",
     "stripe_mask",
 ]

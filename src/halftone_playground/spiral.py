@@ -90,9 +90,9 @@ import math
 import cv2
 import numpy as np
 
-from .stripe import stripe_mask
+from .stripe import stripe_fixed_mask, stripe_mask
 
-__all__ = ["spiral_mask"]
+__all__ = ["spiral_fixed_mask", "spiral_mask"]
 
 #: Hard limit of the OpenCV ``warpPolar`` / ``remap`` implementation: both the
 #: source and the destination image dimensions must stay strictly below this
@@ -189,6 +189,120 @@ def spiral_mask(gray: np.ndarray, period: int, arms: int) -> np.ndarray:
 
     # Binarize before the inverse warp so the whole round trip stays strictly
     # bi-level.
+    polar_lines = np.where(polar_mask, np.uint8(255), np.uint8(0))
+
+    # Inverse linear polar.  ``WARP_FILL_OUTLIERS`` is mandatory: without it
+    # destination pixels whose inverse radius exceeds ``warp_radius`` keep
+    # uninitialised data and the corners become non-deterministic garbage.
+    inverse = cv2.warpPolar(
+        polar_lines,
+        (side, side),
+        center,
+        warp_radius,
+        _INVERSE_FLAGS,
+    )
+
+    return (inverse > 0) & _circular_support(side, center, support_radius)
+
+
+def spiral_fixed_mask(
+    side: int, period: int, line_width: int, arms: int
+) -> np.ndarray:
+    """Return a boolean mask marking a **fixed-width** spiral line area.
+
+    This is the fixed-width sibling of :func:`spiral_mask`.  It reuses exactly
+    the same frozen polar geometry (centre, warp / support radius, sampling,
+    ``arms -> slope``, positive slope / clockwise-outward chirality, inverse
+    nearest mapping, circular support) and the *same* fixed-width Stripe
+    rasterizer, but it never derives a line width from grayscale:
+
+    ==========================  ============================================
+    :func:`spiral_mask`         Cartesian gray -> forward polar gray ->
+                               variable-width Stripe -> ...
+    :func:`spiral_fixed_mask`   polar fixed-width Stripe mask -> inverse ->
+                               circular support
+    ==========================  ============================================
+
+    Because the geometry width does not depend on grayscale there is no
+    meaningful "forward grayscale polar" step to perform: the polar canvas is a
+    pure geometry surface, so the constant ``line_width`` is written directly
+    into it through :func:`halftone_playground.stripe.stripe_fixed_mask` on the
+    polar shape ``(angle_samples, radius_samples)``.  That is the only
+    difference from :func:`spiral_mask`, which additionally has to unwrap the
+    grayscale to know how wide each line is.
+
+    Parameters
+    ----------
+    side:
+        Square side ``N`` of the Cartesian output, a positive integer
+        ``>= :data:`MIN_SIDE```.  A side is accepted rather than a grayscale
+        array: fixed-width geometry never reads a source image.
+    period:
+        Positive integer, the distance between adjacent stripe lines in the
+        *polar* image; measured in pixels of the Cartesian output image.  As
+        everywhere else it is nominal and never rescaled.
+    line_width:
+        Constant line width in output pixels, a positive integer with
+        ``1 <= line_width <= period``.  No automatic clamping: an out-of-range
+        value raises.
+    arms:
+        Positive integer, the number of spiral arms, realised purely through
+        the polar stripe slope.  A complex rosette at the centre for large
+        ``arms`` is an accepted feature of the construction, not a defect.
+
+    Returns
+    -------
+    numpy.ndarray
+        An ``N x N`` ``bool`` array.  ``True`` marks a spiral line pixel;
+        everything outside the circular support (the four corners included) is
+        always ``False``.  The mask carries geometry only and never color.
+
+    Raises
+    ------
+    TypeError
+        If ``period`` / ``line_width`` / ``arms`` is not an integer (booleans
+        included), or ``side`` is not a positive integer.
+    ValueError
+        If ``side`` is below :data:`MIN_SIDE`; if ``line_width`` is outside
+        ``1..period``; if any integer parameter is not positive; or if a source
+        or polar dimension reaches :data:`OPENCV_MAX_DIMENSION`.
+
+    Notes
+    -----
+    Colour is *never* part of this function.  For the source-colour variant the
+    Cartesian RGB is combined with this Cartesian mask afterwards by
+    :func:`halftone_playground.render.render_source_color_on_white`, so the RGB
+    source never enters ``warpPolar`` -- only the binary geometry mask does.
+    """
+    _validate_fixed_inputs(side, period, line_width, arms)
+
+    side = int(side)
+    period = int(period)
+    line_width = int(line_width)
+    arms = int(arms)
+
+    center = _polar_center(side)
+    warp_radius = _warp_radius(side)
+    support_radius = _support_radius(side)
+    radius_samples = _radius_samples(warp_radius)
+    angle_samples = _angle_samples(warp_radius)
+    theta_effective = _effective_stripe_angle(period, arms, angle_samples)
+
+    _validate_opencv_dimensions(
+        side=side,
+        radius_samples=radius_samples,
+        angle_samples=angle_samples,
+    )
+
+    # Constant-width slanted stripes directly on the polar geometry surface,
+    # through the shared fixed-width Stripe core.  No grayscale, and therefore
+    # no forward grayscale polar unwrap.
+    polar_mask = stripe_fixed_mask(
+        (angle_samples, radius_samples), period, line_width, theta_effective
+    )
+
+    # Binarize before the inverse warp so the whole round trip stays strictly
+    # bi-level (same convention as the variable-width core).
     polar_lines = np.where(polar_mask, np.uint8(255), np.uint8(0))
 
     # Inverse linear polar.  ``WARP_FILL_OUTLIERS`` is mandatory: without it
@@ -332,6 +446,41 @@ def _validate_positive_int(value: int, name: str) -> None:
         raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
     if int(value) <= 0:
         raise ValueError(f"{name} must be a positive integer, got {int(value)}")
+
+
+def _validate_fixed_inputs(
+    side: int, period: int, line_width: int, arms: int
+) -> None:
+    """Enforce the strict contract of :func:`spiral_fixed_mask`.
+
+    Mirrors the style of :func:`_validate_inputs`: a square side is required
+    (same Round 1 product boundary), all integers are plain positive integers,
+    and ``line_width`` must lie in ``1..period`` -- out-of-range values are
+    rejected rather than clamped.
+    """
+    if isinstance(side, bool) or not isinstance(side, (int, np.integer)):
+        raise TypeError(f"side must be an integer, got {type(side).__name__}")
+    side = int(side)
+    if side < MIN_SIDE:
+        raise ValueError(f"spiral_fixed_mask requires side >= {MIN_SIDE}, got {side}")
+
+    _validate_positive_int(period, "period")
+    _validate_positive_int(arms, "arms")
+
+    if isinstance(line_width, bool) or not isinstance(
+        line_width, (int, np.integer)
+    ):
+        raise TypeError(
+            f"line_width must be an integer, got {type(line_width).__name__}"
+        )
+    line_width = int(line_width)
+    if line_width <= 0:
+        raise ValueError(f"line_width must be a positive integer, got {line_width}")
+    if line_width > int(period):
+        raise ValueError(
+            f"line_width must not exceed period, got line_width={line_width} > "
+            f"period={int(period)}"
+        )
 
 
 def _validate_opencv_dimensions(
