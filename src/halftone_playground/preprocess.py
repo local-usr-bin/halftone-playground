@@ -1,9 +1,15 @@
-"""Preprocessing layer: optional spatial rescaling of the grayscale source.
+"""Preprocessing layer: optional spatial rescaling of the source image.
 
-The Stripe core itself only ever sees a plain 2-D ``uint8`` grayscale array;
-this module is the small, optional step *before* that core.  It maps a user
-``image_scale`` factor onto a target canvas size and resizes the grayscale
-image accordingly.
+The geometry cores only ever see a plain 2-D ``uint8`` grayscale array; this
+module is the small, optional step *before* those cores.  It maps a user
+``image_scale`` factor onto a target canvas size and resizes the source image
+accordingly -- the grayscale image that feeds geometry, and (Renderer Round 1)
+an optional Cartesian RGB source that feeds the source-colour compositor.
+
+Both resizers share the *same* target-size arithmetic and the *same* fixed
+filter, so a grayscale image and its RGB companion scaled by the same
+``image_scale`` stay pixel-aligned and a mask computed from one lines up with
+the other.
 
 Product rules frozen for this round:
 
@@ -16,6 +22,8 @@ Product rules frozen for this round:
   divided or otherwise adjusted by the scale factor;
 * ``image_scale == 1.0`` returns the input unchanged (a copy), so a no-op
   scale can never alter pixel values;
+* ``resize_grayscale`` and ``resize_rgb`` share one target size and one fixed
+  filter, so a grayscale image and its RGB companion never drift apart;
 * no resource management happens here: computing a target size never
   allocates an image, and if a requested output is too large for the
   machine, that is left to the ordinary failure of the allocation itself.
@@ -28,7 +36,7 @@ import math
 import numpy as np
 from PIL import Image
 
-__all__ = ["scaled_size", "resize_grayscale"]
+__all__ = ["scaled_size", "resize_grayscale", "resize_rgb"]
 
 try:  # Pillow >= 9.1
     _BICUBIC = Image.Resampling.BICUBIC
@@ -124,6 +132,65 @@ def resize_grayscale(gray: np.ndarray, image_scale: float) -> np.ndarray:
     return np.array(resized, dtype=np.uint8)
 
 
+def resize_rgb(rgb: np.ndarray, image_scale: float) -> np.ndarray:
+    """Resize a 3-D ``uint8`` RGB array by ``image_scale``.
+
+    This is the RGB companion of :func:`resize_grayscale`.  When
+    ``image_scale != 1`` and the user picks the source-colour output variant,
+    the RGB source has to land on exactly the same canvas the geometry ran on
+    -- otherwise the mask and the RGB pixels cannot be aligned.  Both resizers
+    therefore share the very same :func:`scaled_size` target (half-up per
+    axis) and the same fixed BICUBIC filter, so they are guaranteed to
+    produce matching dimensions.
+
+    Parameters
+    ----------
+    rgb:
+        A non-empty array of shape ``(height, width, 3)`` with dtype
+        ``uint8``.
+    image_scale:
+        Any positive finite real number.
+
+    Returns
+    -------
+    numpy.ndarray
+        A ``(scaled_H, scaled_W, 3)`` ``uint8`` RGB array whose spatial size
+        is exactly ``scaled_size(*rgb.shape[:2][::-1], image_scale)``.  With
+        ``image_scale == 1.0`` the result is a copy whose pixel values are
+        identical to the input (``np.array_equal`` holds; no resampling is
+        performed at all).  For any other scale the image is resampled with
+        the fixed internal Pillow BICUBIC filter.  The output is never
+        grayscale, never float, never alpha.
+
+    Raises
+    ------
+    TypeError
+        If ``rgb`` is not an ``ndarray``, or the scale is not a real number.
+    ValueError
+        If ``rgb`` is not 3-D, empty, has a channel count other than 3, or is
+        not ``uint8``; if the scale is zero / negative / non-finite; or if the
+        target size collapses below 1x1.
+
+    Notes
+    -----
+    The scale is *not* tied to the Stripe / Spiral ``period``: passing
+    ``image_scale=2.0`` doubles the canvas but leaves ``period`` alone, exactly
+    as with the grayscale path.
+    """
+    _validate_rgb(rgb)
+    scale = _validate_image_scale(image_scale)
+
+    height, width = rgb.shape[:2]
+    target_width, target_height = scaled_size(width, height, scale)
+
+    if scale == 1.0:
+        return rgb.copy()
+
+    image = Image.fromarray(rgb, mode="RGB")
+    resized = image.resize((target_width, target_height), resample=_BICUBIC)
+    return np.array(resized, dtype=np.uint8)
+
+
 def _scaled_axis(original: int, scale: float) -> int:
     """One axis of the half-up rounding rule, with overflow detection."""
     product = original * scale
@@ -170,3 +237,21 @@ def _validate_gray(gray: np.ndarray) -> None:
         raise ValueError("gray must not be empty")
     if gray.dtype != np.uint8:
         raise ValueError(f"gray must have dtype uint8, got {gray.dtype}")
+
+
+def _validate_rgb(rgb: np.ndarray) -> None:
+    """Enforce the strict input contract for :func:`resize_rgb`."""
+    if not isinstance(rgb, np.ndarray):
+        raise TypeError(f"rgb must be a numpy.ndarray, got {type(rgb).__name__}")
+    if rgb.ndim != 3:
+        raise ValueError(
+            f"rgb must be 3-D (height, width, 3), got shape {rgb.shape}"
+        )
+    if rgb.size == 0:
+        raise ValueError("rgb must not be empty")
+    if rgb.shape[2] != 3:
+        raise ValueError(
+            f"rgb must have exactly 3 channels (RGB), got shape {rgb.shape}"
+        )
+    if rgb.dtype != np.uint8:
+        raise ValueError(f"rgb must have dtype uint8, got {rgb.dtype}")

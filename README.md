@@ -26,8 +26,15 @@ image. An optional preprocessing step rescales the source image
 **Spiral mode Round 1 core is implemented.** It reuses the very same Stripe
 core inside a linear polar unwrap; see the Spiral section below.
 
-There is no CLI and no GUI. Not implemented yet: colored or inverted output,
-transparency, non-square Spiral input.
+**Renderer / Compositor Round 1 is implemented.** The geometry core and the
+pixels are fully separated: Stripe and Spiral both emit only a `bool` mask
+(`True` = line), and independent renderers decide what a line pixel looks
+like. Three output variants ship today — white background + black line, black
+background + white line, and white background + the source image's own colour
+on the line.
+
+There is no CLI and no GUI. Not implemented yet: fixed-width coloured lines,
+transparency / alpha and custom RGB backgrounds, non-square Spiral input.
 
 ## Stripe parameters
 
@@ -62,9 +69,7 @@ image_scale)`; the pipeline order is `source → grayscale → BICUBIC resize �
 stripe_mask → renderer`.
 
 Rendering is a separate step, `render_black_on_white(mask)`, which returns a
-`uint8` image with lines as `0` and background as `255`.
-
-```python
+`uint8` image with lines as `0` and background as `255`.```python
 import numpy as np
 from halftone_playground import (
     resize_grayscale, scaled_size, stripe_mask, render_black_on_white,
@@ -137,9 +142,87 @@ Spiral mode uses OpenCV's `warpPolar`, whose underlying `remap` currently caps
 image dimensions at less than 32767 pixels; larger sources raise a clear
 `ValueError` instead of being tiled or silently downscaled.
 
+## Renderers and compositors
+
+Both geometry modes produce exactly one thing: a `bool` mask where `True`
+marks a line pixel. What that pixel *looks like* is decided by a separate,
+pure layer. Because the renderer only ever reads the mask, the very same mask
+can be rendered several ways with **identical geometry** — only the pixel
+values change. No renderer recomputes gray, recomputes line width, or smooths
+/ resizes / blurs the mask.
+
+| function | `mask=True` | `mask=False` | output |
+|---|---|---|---|
+| `render_black_on_white(mask)` | `0` | `255` | 2-D `uint8` |
+| `render_white_on_black(mask)` | `255` | `0` | 2-D `uint8` |
+| `render_source_color_on_white(mask, source_rgb)` | `source_rgb[y, x]` | `(255, 255, 255)` | `H×W×3` `uint8` |
+
+- **White on black is a true renderer inversion.** The mask is consumed
+  unchanged; there is no `invert` parameter in the Stripe or Spiral cores. For
+  one mask the two binary renderers are per-pixel complements
+  (`black_on_white + white_on_black == 255`). The whole canvas background
+  becomes black, corners outside a shape's support included.
+- **Source colour is still variable width.** The existing width mask drives
+  the geometry; only the line pixel value changes from black to the matching
+  source pixel. This is *not* a fixed-width coloured-line variant.
+
+### Source colour and Cartesian space
+
+`render_source_color_on_white` copies colour from the **Cartesian** RGB source
+at the final Cartesian coordinates:
+
+```
+Cartesian RGB source ──┐
+                       ├─► Cartesian grayscale ─► Stripe / Spiral core ─► Cartesian bool mask ─┐
+                       │                                                                       │
+                       └───────────────────────────────────────────────────────────────────────┴─► RGB output
+```
+
+For Spiral in particular the colour **never enters the polar pipeline**: there
+is no forward unwrap and no inverse unwrap for RGB, so no extra colour
+resampling is introduced. A line pixel is a byte-for-byte copy of the source
+pixel — no re-tinting, quantization, gamma or alpha blending. Line pixels keep
+the source's own tones, so the colour variant reads as a textured tone study
+rather than a literal photo.
+
+The background is fixed to white; there is no `background_color` parameter and
+no alpha channel in this round.
+
+### Aligning the RGB source (`image_scale`)
+
+When `image_scale != 1` and the source-colour variant is used, the RGB source
+must land on the same canvas the geometry ran on. `resize_rgb(rgb,
+image_scale)` is the RGB companion of `resize_grayscale`: it shares the exact
+same `scaled_size` target and the same fixed BICUBIC filter, so the two never
+drift apart.
+
+```python
+import numpy as np
+from PIL import Image
+from halftone_playground import (
+    resize_grayscale, resize_rgb, stripe_mask, render_source_color_on_white,
+)
+
+src = Image.open("photo.png").convert("RGB")
+rgb = np.array(src, dtype=np.uint8)          # Cartesian RGB source
+gray = np.array(Image.open("photo.png").convert("L"), dtype=np.uint8)
+
+gray_s = resize_grayscale(gray, 1.3)         # both use the same target size
+rgb_s = resize_rgb(rgb, 1.3)                 # and the same BICUBIC filter
+mask = stripe_mask(gray_s, period=16, angle_deg=90.0)
+
+out = render_source_color_on_white(mask, rgb_s)   # H×W×3 uint8, white background
+```
+
+The compositor never resizes: if `source_rgb` does not match `mask` exactly it
+raises `ValueError` rather than silently stretching. Spatial alignment is a
+preprocessing concern. As everywhere else, `image_scale` and `period` stay
+independent — scaling the canvas does not touch the period.
+
 ## Layout
 
-- `src/halftone_playground/` — package code (`stripe.py` and `spiral.py` geometry, `render.py` output)
+- `src/halftone_playground/` — package code (`stripe.py` and `spiral.py`
+  geometry, `preprocess.py` scaling, `render.py` output)
 - `tests/` — pytest suite
 - `scripts/` — small runnable helpers
 - `samples/` — generated example images
@@ -175,3 +258,16 @@ Regenerate the Spiral acceptance images into `samples/spiral/`:
 ```bash
 python scripts/generate_spiral_samples.py
 ```
+
+Regenerate the renderer / compositor samples into `samples/render/` (the same
+Stripe and Spiral geometry rendered black-on-white, white-on-black and in
+source colour):
+
+```bash
+python scripts/generate_renderer_samples.py
+```
+
+The real-image review set (six renderer outputs plus a mobile-friendly review
+sheet) is generated by `scripts/make_renderer_review.py`. It consumes the
+public-domain scikit-image sample photograph outside the repository and its
+outputs are deliberately not committed.
