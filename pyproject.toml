@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "numpy",
     "pillow",
+    "opencv-python-headless>=4.8,<5",
 ]
 
 [project.optional-dependencies]
