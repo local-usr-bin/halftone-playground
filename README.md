@@ -40,8 +40,12 @@ width no longer depends on grayscale at all — only the colour still comes from
 the Cartesian source image, via the existing
 `render_source_color_on_white` compositor. See the Fixed-width section below.
 
-There is no CLI and no GUI. Not implemented yet: transparency / alpha, custom
-RGB backgrounds, and non-square Spiral input.
+**A first command-line interface is implemented.** `halftone-playground`
+(and `python -m halftone_playground`) wires the existing cores and renderers
+into a single-image tool. See the [CLI](#cli) section below.
+
+There is no GUI. Not implemented yet: transparency / alpha, custom RGB
+backgrounds, non-square Spiral input, batch processing.
 
 ## Stripe parameters
 
@@ -285,10 +289,126 @@ raises `ValueError` rather than silently stretching. Spatial alignment is a
 preprocessing concern. As everywhere else, `image_scale` and `period` stay
 independent — scaling the canvas does not touch the period.
 
+## CLI
+
+Install the package and a `halftone-playground` command becomes available:
+
+```bash
+pip install .
+halftone-playground --help
+```
+
+The very same behaviour is reachable without installing anything, via the
+module entry point (handy from a source checkout with `pythonpath = ["src"]`
+already configured, or with `PYTHONPATH=src`):
+
+```bash
+python -m halftone_playground --help
+```
+
+### Syntax
+
+```
+halftone-playground stripe INPUT OUTPUT [options]
+halftone-playground spiral INPUT OUTPUT [options]
+python -m halftone_playground stripe INPUT OUTPUT [options]
+```
+
+`stripe` and `spiral` are required subcommands; `INPUT` and `OUTPUT` are
+positional. `OUTPUT` must end in `.png` (case-insensitive).
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--period INT` | `16` | Distance between adjacent line centres, in pixels of the output. |
+| `--scale FLOAT` | `1.0` | Rescale the source before geometry runs. Any positive finite value; no upper limit. |
+| `--render CHOICE` | `black-on-white` | One of `black-on-white`, `white-on-black`, `source-color`. |
+| `--line-width INT` | *(unset)* | **Presence switches the geometry to fixed-width** (see below). |
+| `--angle FLOAT` | `90.0` | *(stripe)* Stripe orientation: 90 = vertical, 0/180 = horizontal. |
+| `--arms INT` | `1` | *(spiral)* Number of spiral arms. |
+
+### Variable-width vs fixed-width
+
+There is no `--width-mode` flag — one blunt rule decides:
+
+- **`--line-width` omitted** → variable-width geometry (`stripe_mask` /
+  `spiral_mask`). The local luminance of the source drives each line's width.
+- **`--line-width N`** → fixed-width geometry (`stripe_fixed_mask` /
+  `spiral_fixed_mask`). Every full cell draws exactly `N` pixels and the
+  source luminance **no longer affects the line width at all**.
+
+  With `--render black-on-white` / `white-on-black` the input image content
+  therefore only still decides the canvas size (and, through `--scale`, the
+  scaled canvas size) — the drawn geometry is identical whatever the picture
+  holds. With `--render source-color` the source RGB still colours the lines,
+  exactly as in the variable-width case, because colour and geometry are
+  separate layers.
+
+### `image_scale` and the period are independent
+
+`--scale 2 --period 16 --line-width 5` means: double the image dimensions,
+then run period `16` / width `5`. Nothing is auto-scaled — `--scale` never
+touches `--period` or `--line-width`. If you want the visual density to stay
+proportional, adjust those by hand.
+
+### Examples
+
+```bash
+# Variable stripe, black on white
+halftone-playground stripe input.jpg output.png
+
+# Variable stripe, source colour, rotated, scaled 1.3x
+halftone-playground stripe input.jpg output.png --period 16 --angle 45 --scale 1.3 --render source-color
+
+# Fixed stripe, source colour
+halftone-playground stripe input.jpg output.png --period 16 --line-width 5 --angle 90 --render source-color
+
+# Variable spiral (square input), 3 arms
+halftone-playground spiral square.jpg output.png --period 16 --arms 3
+
+# Fixed spiral, source colour
+halftone-playground spiral square.jpg output.png --period 16 --line-width 5 --arms 3 --render source-color
+
+# Module form
+python -m halftone_playground stripe input.jpg output.png
+```
+
+Before processing, the CLI prints the resolved resolutions, e.g.:
+
+```
+Input: 512x512
+Output: 666x666
+```
+
+### Round 1 boundaries
+
+- **Output is PNG only.** Strict bi-level pixels and exact source-RGB pixels
+  must survive a round trip, so lossy formats (JPEG, WebP, ...) are rejected
+  as output.
+- **Spiral requires a square input.** No automatic crop / fit / letterbox /
+  pad is implemented; a non-square input is rejected with a clear error.
+- **Input** is any single-frame raster image Pillow can read (PNG and JPEG are
+  the primary targets). Multi-frame images are rejected rather than partially
+  processed.
+- **No batch processing**, no folder traversal, no GUI.
+- If `INPUT` and `OUTPUT` resolve to the same file the run is refused.
+- Missing output parent directories are created automatically; an existing
+  output file is overwritten.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | Runtime failure (reading / decoding the input, writing the output). |
+| `2` | Usage or validation failure (bad arguments, non-PNG output, non-square spiral input, output would overwrite the input, ...). argparse's own parse errors also exit `2`. |
+
 ## Layout
 
 - `src/halftone_playground/` — package code (`stripe.py` and `spiral.py`
-  geometry, `preprocess.py` scaling, `render.py` output)- `tests/` — pytest suite
+  geometry, `preprocess.py` scaling, `render.py` output, `cli.py` command line)
+- `tests/` — pytest suite
 - `scripts/` — small runnable helpers
 - `samples/` — generated example images
 - `docs/` — future design notes

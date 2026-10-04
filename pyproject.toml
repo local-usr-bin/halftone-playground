@@ -18,6 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[project.scripts]
+halftone-playground = "halftone_playground.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
