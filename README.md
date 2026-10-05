@@ -44,17 +44,18 @@ the Cartesian source image, via the existing
 (and `python -m halftone_playground`) wires the existing cores and renderers
 into a single-image tool. See the [CLI](#cli) section below.
 
-**A first GUI shell is implemented (GUI-001).** A plain Tkinter/ttk window
-(Controls on the left, Source / Result previews on the right) can open an
-image, show a source preview and validate parameters. `Generate` and
-`Save PNG…` are present but **disabled**: the real generation pipeline is a
-later round. The GUI accepts a rectangular source for Spiral and projects the
-centered maximum square it will use (see the [GUI](#gui) section below). See
+**A first GUI shell is implemented (GUI-001), and a real generation pipeline
+now runs in it (GUI-002A).** A plain Tkinter/ttk window (Controls on the left,
+Source / Result previews on the right) can open an image, show a source
+preview, validate parameters and **Generate** the real full-resolution result
+on a background worker. The GUI accepts a rectangular source for Spiral and
+performs the centered maximum-square crop itself. `Save PNG…` is still
+disabled (that is GUI-002B). See the [GUI](#gui) section below and
 [`docs/GUI_ROUND0_DECISIONS.md`](docs/GUI_ROUND0_DECISIONS.md) for the frozen
 GUI decisions.
 
-Not implemented yet: the GUI generation / save pipeline, transparency / alpha,
-custom RGB backgrounds, batch processing.
+Not implemented yet: the GUI Save PNG workflow, transparency editing beyond the
+Spiral disc, custom RGB backgrounds, batch processing.
 
 ## Stripe parameters
 
@@ -245,6 +246,19 @@ values change. No renderer recomputes gray, recomputes line width, or smooths
   the geometry; only the line pixel value changes from black to the matching
   source pixel. This is *not* a fixed-width coloured-line variant.
 
+#### White on black in the GUI keeps the source positive
+
+At the **renderer** level white-on-black is an inversion of one mask, as above.
+At the **GUI / application** level the product rule is different: the white line
+must grow with the source's *brightness* (`W_white = P · G`), so a white area
+stays white instead of reading as a photographic negative. The GUI therefore
+inverts the already cropped and scaled grayscale for the Variable +
+White-on-black combination before it reaches the geometry
+(`preprocess.invert_luminance`), leaving the frozen `W = P · (1 − G)` formula,
+the cores' API and the renderers untouched. Fixed width and Source colour are
+never inverted, Black on white is unchanged, and the Spiral alpha channel is
+still decided only by the circular support.
+
 ### Source colour and Cartesian space
 
 `render_source_color_on_white` copies colour from the **Cartesian** RGB source
@@ -415,9 +429,10 @@ Output: 666x666
 
 ## GUI
 
-A first GUI shell ships as **GUI-001**. It is a thin entry point **parallel**
-to the CLI and calls the same Python APIs directly — it never shells out to the
-CLI and never reimplements geometry.
+A GUI shell ships as **GUI-001**, extended with a real generation pipeline in
+**GUI-002A**. It is a thin entry point **parallel** to the CLI and calls the
+same Python APIs directly — it never shells out to the CLI and never
+reimplements geometry.
 
 Launch it as a module (from a source checkout with `PYTHONPATH=src`, or after
 `pip install .`):
@@ -444,10 +459,34 @@ What GUI-001 does:
   readout projects a square for Spiral while Stripe keeps the source aspect
   ratio. There is no manual crop UI and no crop editor.
 
-What GUI-001 deliberately does **not** do (later rounds):
+What **GUI-002A** adds:
 
-- `Generate` and `Save PNG…` are present but **disabled** — there is no
-  generation pipeline, worker, cancel or save yet;
+- a real **`Generate`** button. It is enabled when a source is loaded, the
+  parameters validate and no job is running; it runs the whole preprocess /
+  geometry / render chain at **full resolution**;
+- the centered maximum-square crop for Spiral is now **actually performed**, in
+  the frozen order — crop first, then scale. Stripe is never cropped;
+- a real **Result Preview** showing the actual output (a display-only scaled
+  copy; the stored result stays full-resolution). No geometry is ever re-run at
+  preview resolution;
+- the **`current` / `stale`** lifecycle. Changing an output-affecting parameter
+  marks the result stale; returning to the same *semantic* configuration makes
+  it current again (`Scale = 1` and `Scale = 1.0` are the same configuration).
+  A stale result is still displayed, and a new source clears it outright;
+- correct output semantics for all 12 combinations:
+  **Stripe → `H × W × 3` RGB with no alpha**, **Spiral → `N × N × 4` RGBA**
+  whose alpha is exactly the circular support (`255` inside the disc, `0`
+  outside, only those two values) and never derived from the line mask;
+- a **single background worker** (no queue, no job manager, no Cancel). The Tk
+  main thread is the only thread that touches widgets, the hand-off is a
+  `queue.Queue` drained from an `after` poll, and the worker thread is a daemon
+  so closing the window mid-job is safe.
+
+What this round deliberately does **not** do (later rounds):
+
+- `Save PNG…` is present but still **disabled** — saving is GUI-002B;
+- no `Cancel`, no job queue, no second worker, no batch processing, no history,
+  no preset manager, no crop UI, no zoom / pan, no theming;
 - no packaging, no installer, no portable build.
 
 The frozen GUI decisions (layout, state model, boundaries, stage order) live in
@@ -457,8 +496,9 @@ The frozen GUI decisions (layout, state model, boundaries, stage order) live in
 
 - `src/halftone_playground/` — package code (`stripe.py` and `spiral.py`
   geometry, `preprocess.py` scaling, `render.py` output, `cli.py` command line)
-- `src/halftone_playground/gui/` — the Tk/ttk GUI shell (`params.py` /
-  `state.py` / `imageutil.py` are toolkit-free logic; `app.py` is the widgets)
+- `src/halftone_playground/gui/` — the Tk/ttk GUI (`params.py` / `state.py` /
+  `imageutil.py` / `pipeline.py` / `worker.py` are toolkit-free logic; `app.py`
+  is the widgets)
 - `tests/` — pytest suite
 - `scripts/` — small runnable helpers
 - `samples/` — generated example images
@@ -490,8 +530,10 @@ pytest -m gui                    # GUI shell tests, needs DISPLAY
 xvfb-run -a pytest -m gui        # ...or run them under a virtual display
 ```
 
-The toolkit-free GUI *logic* tests (`params` / `state` / `imageutil`) are
-ordinary tests and always run.
+The toolkit-free GUI *logic* tests (`params` / `state` / `imageutil` /
+`pipeline` / `worker`) are ordinary tests and always run — including the full
+12-combination generation matrix, the Spiral crop-before-scale order and the
+alpha semantics, none of which need a display.
 
 ## Sample images
 

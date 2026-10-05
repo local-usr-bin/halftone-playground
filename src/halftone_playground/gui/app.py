@@ -1,38 +1,60 @@
-"""Tkinter / ttk GUI shell for halftone-playground (GUI-001).
+"""Tkinter / ttk GUI shell for halftone-playground (GUI-001 + GUI-002A).
 
 This is a *thin* entry point, exactly like :mod:`halftone_playground.cli`.  It
 owns widgets and event wiring only; every decision that can be made without a
-toolkit lives in :mod:`halftone_playground.gui.params` and
-:mod:`halftone_playground.gui.state`, and the image display scaling lives in
-:mod:`halftone_playground.gui.imageutil`.
+toolkit lives in :mod:`halftone_playground.gui.params`,
+:mod:`halftone_playground.gui.state` and
+:mod:`halftone_playground.gui.pipeline`, the image display scaling lives in
+:mod:`halftone_playground.gui.imageutil`, and the concurrency lives in
+:mod:`halftone_playground.gui.worker`.
 
-What GUI-001 does
------------------
+What GUI-001 did
+----------------
 
 * a plain, restrained ttk layout: **Controls on the left**, a horizontal
   **Source Preview | Result Preview** pair on the right, an inline
   status / validation strip along the bottom;
-* ``Open Image...`` loads a single-frame raster (PNG / JPEG and anything else
-  Pillow can read), shows the filename, the source ``W x H``, the source
-  preview and the projected output resolution;
+* ``Open Image...`` loads a single-frame raster, shows the filename, the
+  source ``W x H``, the source preview and the projected output resolution;
 * mode / width-mode / render controls, with Stripe-Spiral and
   Variable-Fixed parameter visibility that **never resets hidden values**;
-* inline validation reusing the core contracts, and a projected output
-  resolution that follows the mode: Stripe keeps the source aspect ratio while
-  Spiral projects the **centered maximum square** the GUI will use (see
-  :mod:`halftone_playground.gui.params`) -- a projection only, no image is
-  cropped or resized in GUI-001.
+* inline validation reusing the core contracts.
 
-What GUI-001 deliberately does **not** do
------------------------------------------
+What GUI-002A adds
+------------------
 
-* no real ``Generate`` pipeline (the button is present but disabled);
-* no real ``Save PNG...`` implementation (disabled);
-* no worker thread, no cancel, no stale-result pipeline, no packaging.
+* a **real ``Generate`` pipeline**: the button is enabled when a source is
+  loaded, the parameters validate and no job is running, and it runs the whole
+  preprocess / geometry / render chain at **full resolution** on a single
+  background worker;
+* the **centered maximum-square crop for Spiral** is actually performed, in
+  the frozen order (crop, then scale) -- GUI-001 only projected it;
+* a **real Result Preview** showing the actual output (a display-only scaled
+  copy -- the stored result stays full-resolution);
+* the **``current`` / ``stale`` result lifecycle**, including the automatic
+  return to ``current`` when the parameters go back to the same semantic
+  configuration;
+* correct **RGB / RGBA output semantics**: Stripe results are ``H x W x 3``
+  with no alpha, Spiral results are ``N x N x 4`` whose alpha is exactly the
+  circular support (never derived from the line mask).
 
-The layout is intentionally pre-wired for GUI-002: the action-row, result-area
-and status helpers already exist so the future pipeline has an obvious home,
-without building a speculative framework now.
+What GUI-002A still does **not** do
+-----------------------------------
+
+* no real ``Save PNG...`` (the button stays disabled -- that is GUI-002B);
+* no ``Cancel``, no job queue, no second worker, no batch processing, no
+  history, no preset manager, no crop UI, no zoom / pan, no theming.
+
+Threading contract
+------------------
+
+The Tk main thread is the **only** thread that touches a widget.  ``Generate``
+snapshots the parameters into an immutable request, hands it to
+:class:`~halftone_playground.gui.worker.GenerationWorker` and then polls a
+``queue.Queue`` from a ``root.after`` callback; the worker thread computes and
+posts exactly one outcome and never imports Tk.  While a job runs every input
+is locked, and closing the window needs no special handling because the worker
+thread is a daemon.
 """
 
 from __future__ import annotations
@@ -45,7 +67,9 @@ from typing import Optional
 from PIL import Image, ImageTk
 
 from . import imageutil, params as gui_params
-from .state import GuiState, SourceInfo
+from .pipeline import GenerationKey, GenerationRequest
+from .state import GuiState, ResultInfo, SourceInfo
+from .worker import GenerationJob, GenerationWorker, WorkerOutcome
 
 __all__ = ["HalftoneApp", "run"]
 
@@ -84,6 +108,15 @@ _WIDTH_LABELS = {
     gui_params.WIDTH_FIXED: "Fixed",
 }
 
+#: How often the main thread drains the worker's queue, in milliseconds.  The
+#: worker cannot call into Tk, so the wake-up is a poll.  Small enough that a
+#: fast job feels instant, large enough to be free while one runs.
+_POLL_INTERVAL_MS = 30
+
+#: Placeholder text for the result preview when there is nothing to show.
+_NO_RESULT_TEXT = "No result yet"
+_STALE_SUFFIX = "  (stale \u2014 press Generate to refresh)"
+
 
 class HalftoneApp:
     """The single Tk application object.
@@ -101,13 +134,25 @@ class HalftoneApp:
         self.params = gui_params.RenderParams()
 
         #: The full-resolution decoded source (display only; never mutated by
-        #: the preview code and never handed to geometry in GUI-001).
+        #: the preview code).  The Generate pipeline re-reads the *file* on
+        #: the worker thread instead of sharing this object.
         self._source_image: Optional[Image.Image] = None
         #: Strong references to the on-screen PhotoImages.  Tk keeps only a
         #: weak reference, so without these the images are garbage collected
         #: and the labels go blank -- the classic Tkinter image-lifetime trap.
         self._source_photo: Optional[ImageTk.PhotoImage] = None
         self._result_photo: Optional[ImageTk.PhotoImage] = None
+
+        #: The **real, full-resolution** result pixels (a numpy array) and its
+        #: metadata.  The Result Preview is only ever a scaled-down *copy* of
+        #: this; the two are strictly separate and the preview code never
+        #: writes back into the result.
+        self._result_pixels = None
+        self._result_image: Optional[Image.Image] = None
+        #: The last (box_w, box_h, label, id) the result preview was built
+        #: for, so it is rebuilt only when the box, the image or the stale
+        #: state actually changes.
+        self._result_preview_key = None
 
         #: The last (box_w, box_h, source_id) the source preview was built for.
         #: Reconfiguring the preview label changes its size and therefore fires
@@ -117,6 +162,10 @@ class HalftoneApp:
         self._preview_key: Optional[tuple[int, int, int]] = None
         #: Whether a source-preview rebuild is already scheduled for idle time.
         self._preview_pending: bool = False
+
+        #: The single generation worker and its poll token.
+        self._worker = GenerationWorker()
+        self._poll_after_id: Optional[str] = None
 
         self._build_window()
         self._build_layout()
@@ -151,9 +200,11 @@ class HalftoneApp:
         bar.grid(row=0, column=0, sticky="ew")
         bar.columnconfigure(1, weight=1)
 
-        ttk.Button(
+        open_btn = ttk.Button(
             bar, text="Open Image\u2026", command=self._on_open_image
-        ).grid(row=0, column=0, sticky="w")
+        )
+        open_btn.grid(row=0, column=0, sticky="w")
+        self._open_btn = open_btn
 
         self._filename_var = tk.StringVar(value="No image loaded")
         ttk.Label(
@@ -414,6 +465,7 @@ class HalftoneApp:
     def _run_scheduled_preview_refresh(self) -> None:
         self._preview_pending = False
         self._refresh_source_preview()
+        self._refresh_result_preview()
 
     # -- bottom: status bar --------------------------------------------
 
@@ -443,16 +495,19 @@ class HalftoneApp:
     def _on_mode_changed(self, _event=None) -> None:
         self.params.mode = self._label_to_mode(self._mode_var.get())
         self._sync_mode_state()
+        self._sync_stale()
         self.refresh()
 
     def _on_width_changed(self, _event=None) -> None:
         self.params.width_mode = self._label_to_width(self._width_var.get())
+        self._sync_stale()
         self.refresh()
 
     def _on_render_changed(self, _event=None) -> None:
         self.params.render = _RENDER_BY_LABEL.get(
             self._render_var.get(), self.params.render
         )
+        self._sync_stale()
         self.refresh()
 
     def _on_param_text_changed(self, name: str) -> None:
@@ -461,16 +516,153 @@ class HalftoneApp:
         # decides what is legal, so an in-progress edit stays representable.
         text = self._param_rows[name]["var"].get()
         setattr(self.params, f"{name}_text", text)
+        self._sync_stale()
         self.refresh()
 
+    def _sync_stale(self) -> None:
+        """Reconcile ``current`` / ``stale`` after any parameter change.
+
+        A single call site for the whole rule: re-derive the live semantic key
+        and let the state model compare it with the result's key.  Because the
+        comparison is on the *normalized* key, typing ``1.0`` where the result
+        was made with ``1`` leaves the result ``current``, and moving a
+        parameter away and back also ends ``current``.
+
+        Nothing here re-runs geometry, and nothing here touches the stored
+        full-resolution pixels -- a stale result keeps being displayed.
+        """
+        if self.state.result is None:
+            return
+        self.state.sync_result_status(self._current_generation_key())
+        self._result_preview_key = None  # the stale marker is drawn on it
+
     def _on_generate(self) -> None:
-        # GUI-001: no pipeline exists.  The button is disabled, so this is a
-        # defensive no-op rather than a stub implementation.
-        pass
+        """Start one generation job, if the rules allow it.
+
+        Everything the worker needs is snapshotted here, on the main thread:
+        the request is immutable, so a later parameter edit cannot reach into
+        the running job.  Nothing about the pipeline itself is touched here --
+        this method only composes the request and starts the worker.
+        """
+        if not self._generate_allowed():
+            return
+        if self.state.source is None:
+            return
+
+        source = self.state.source
+        try:
+            request = GenerationRequest.from_params(
+                self.params, source.path, source.size
+            )
+        except Exception as exc:  # noqa: BLE001 - a snapshot must never crash
+            # ``_generate_allowed`` already ran validation, so this is a bug
+            # guard rather than an expected path.  Report it as a normal
+            # message rather than letting a traceback reach the user.
+            self._show_error("Cannot generate", str(exc))
+            return
+
+        job = GenerationJob(request=request)
+        if not self._worker.start(job):
+            # A job is already running; the button should have been disabled.
+            return
+
+        self.state.begin_job()
+        self.state.status_message = "Generating\u2026"
+        self.refresh()
+        self._ensure_polling()
 
     def _on_save(self) -> None:
-        # GUI-001: no Save implementation and no result to save.
+        # GUI-002A: still no Save implementation.  The button is disabled, so
+        # this is a defensive no-op rather than a stub (Save PNG is GUI-002B).
         pass
+
+    # ------------------------------------------------------------------
+    # generation worker plumbing
+    # ------------------------------------------------------------------
+
+    def _generate_allowed(self) -> bool:
+        """The full ``Generate`` eligibility rule, in one place."""
+        return self.state.generate_allowed(
+            params_valid=not gui_params.validate(self.params)
+        )
+
+    def _ensure_polling(self) -> None:
+        """Make sure exactly one worker-poll callback is scheduled."""
+        if self._poll_after_id is None:
+            self._poll_after_id = self.root.after(
+                _POLL_INTERVAL_MS, self._poll_worker
+            )
+
+    def _poll_worker(self) -> None:
+        """Drain the worker queue on the main thread (the only Tk thread).
+
+        ``after`` callbacks run on the main thread, which is what makes this
+        the correct place to touch widgets.  The callback re-arms itself only
+        while a job is still running, so an idle GUI does no polling at all.
+        """
+        self._poll_after_id = None
+        for outcome in self._worker.drain():
+            self._handle_outcome(outcome)
+        if self._worker.busy:
+            self._ensure_polling()
+
+    def _handle_outcome(self, outcome: WorkerOutcome) -> None:
+        """Install a finished job's result, or report its error."""
+        # Deliver only the job we actually started.  A superseded outcome (a
+        # source was replaced mid-flight) is dropped rather than displayed.
+        if outcome.job is not self._worker.current_job:
+            return
+
+        self._worker.reset()
+        self.state.end_job()
+
+        if not outcome.ok:
+            self.state.status_message = outcome.error or ""
+            self.refresh()
+            self._show_error("Cannot generate", outcome.error or "")
+            return
+
+        result = outcome.result
+        assert result is not None  # guaranteed by ``ok``
+
+        # The result belongs to the source that is loaded *now*.  If the user
+        # swapped the image while the job ran, the outcome is meaningless.
+        source = self.state.source
+        if source is None or source.path != outcome.job.request.source_path:
+            self.state.status_message = "Ready."
+            self.refresh()
+            return
+
+        info = ResultInfo(
+            width=result.width,
+            height=result.height,
+            generation_key=result.key,
+            source_path=source.path,
+            mode=result.mode,
+        )
+        self._result_pixels = result.pixels
+        self._result_image = Image.fromarray(result.pixels, mode=result.mode)
+        self._result_preview_key = None  # force a rebuild for the new image
+
+        self.state.set_result(info)
+        # Re-derive current/stale from the live parameters.  Generating with
+        # the current parameters means ``current`` by construction, but going
+        # through the same reconciliation keeps one code path.
+        self.state.sync_result_status(self._current_generation_key())
+        self.state.status_message = "Ready."
+        self.refresh()
+
+    def _current_generation_key(self):
+        """The live semantic key, or ``None`` when the parameters are invalid.
+
+        Returning ``None`` for an invalid configuration is deliberate: an
+        unparseable field can never equal a stored key, so the result is
+        correctly reported ``stale`` while the field is broken and returns to
+        ``current`` automatically once it parses again.
+        """
+        if gui_params.validate(self.params):
+            return None
+        return GenerationKey.from_params(self.params)
 
     # ------------------------------------------------------------------
     # source loading
@@ -495,17 +687,26 @@ class HalftoneApp:
         source = SourceInfo(path=path, width=image.size[0], height=image.size[1])
         self.state.set_source(source)
         self._source_image = image
+        # A new source clears the result outright (frozen rule): drop the
+        # full-resolution pixels too, not just the metadata, so nothing from
+        # the previous picture can be displayed again.
+        self._clear_result_preview()
 
         self._filename_var.set(source.filename)
         self._source_res_var.set(
             f"Source: {gui_params.format_resolution(source.size)}"
         )
-        self._clear_result_preview()
+        self.state.status_message = "Ready."
         self.refresh()
 
     def _clear_result_preview(self) -> None:
+        """Drop the stored result and blank the Result Preview."""
+        self._result_pixels = None
+        self._result_image = None
         self._result_photo = None
-        self._result_image_label.configure(text="No result yet", image="")
+        self._result_preview_key = None
+        self.state.clear_result()
+        self._result_image_label.configure(text=_NO_RESULT_TEXT, image="")
         self._result_image_label.image = None  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
@@ -517,7 +718,8 @@ class HalftoneApp:
 
         One method so there is exactly one place where state -> widgets
         happens.  Order matters only in that visibility is applied before the
-        status text is computed.
+        status text is computed, and the result preview is refreshed after the
+        stale status has been settled.
         """
         self._apply_parameter_visibility()
         self._apply_output_resolution()
@@ -560,6 +762,24 @@ class HalftoneApp:
         self._status_var.set(message)
 
     def _compose_status(self) -> str:
+        """The single inline status line.
+
+        Priority order (highest first):
+
+        1. a running job (so the user is never told "Ready" mid-generate);
+        2. a validation error on a visible field;
+        3. an explicit message left by the worker (e.g. a failure);
+        4. a stale-result hint;
+        5. a neutral "ready" / idle message.
+
+        A rectangular source with ``Mode = Spiral`` is a *legal* configuration
+        (the GUI takes the centered maximum square automatically), so it never
+        produces a compatibility error here.  Nothing here ever shows a
+        traceback; the messages are plain sentences.
+        """
+        if self.state.is_running:
+            return "Generating\u2026"
+
         errors = gui_params.validate(self.params)
         if errors:
             # Preserve a stable, readable order rather than dict order.
@@ -576,16 +796,26 @@ class HalftoneApp:
 
         if not self.state.has_source:
             return "Open an image to begin."
+
+        if self.state.result_status == "stale":
+            return "Parameters changed. Press Generate to refresh the result."
+
+        if self.state.status_message:
+            return self.state.status_message
+
         return "Ready."
 
     def _apply_lock_state(self) -> None:
         """Enable / disable widgets from the state model.
 
-        In GUI-001 ``Generate`` and ``Save PNG...`` are always disabled because
-        no pipeline exists.  The *rules* (``can_generate`` / ``can_save``)
-        already live in the state model, so GUI-002 only has to relax this
-        method.  When a job is running, all user inputs lock -- also expressed
-        here ahead of time.
+        While a job runs, every input locks -- including ``Open Image``, so
+        the source cannot be swapped out from under the worker.
+
+        ``Generate`` is enabled exactly when the full eligibility rule holds
+        (source loaded + parameters valid + nothing running).
+        ``Save PNG...`` stays disabled in GUI-002A: saving is GUI-002B, and
+        showing a live button that does nothing would be worse than an
+        honestly disabled one.
         """
         locked = self.state.inputs_locked
         input_state = "disabled" if locked else "normal"
@@ -595,10 +825,53 @@ class HalftoneApp:
         self._mode_box.configure(state="disabled" if locked else "readonly")
         self._width_box.configure(state="disabled" if locked else "readonly")
         self._render_box.configure(state="disabled" if locked else "readonly")
+        self._open_btn.configure(state="disabled" if locked else "normal")
 
-        # GUI-001: no real generation -> both actions stay disabled.
-        self._generate_btn.configure(state="disabled")
+        self._generate_btn.configure(
+            state="normal" if self._generate_allowed() else "disabled"
+        )
         self._save_btn.configure(state="disabled")
+
+    def _refresh_result_preview(self) -> None:
+        """Rebuild the on-screen result preview from the real full-res result.
+
+        The preview is a **display-only** scaled copy: the stored
+        :attr:`_result_pixels` is never resized in place and never replaced by
+        the preview.  No geometry is ever re-run here -- the preview scales the
+        *finished output*, it does not re-render anything at low resolution.
+
+        A stale result keeps being shown (GUI Round 0: a stale result may
+        still be displayed); the label simply gains a marker so the user can
+        tell it no longer matches the parameters.
+        """
+        if self._result_image is None:
+            self._result_photo = None
+            self._result_preview_key = None
+            self._result_image_label.configure(text=_NO_RESULT_TEXT, image="")
+            self._result_image_label.image = None  # type: ignore[attr-defined]
+            return
+
+        box = self._preview_box()
+        stale = self.state.result_status == "stale"
+        key = (box[0], box[1], id(self._result_image), stale)
+        if key == self._result_preview_key and self._result_photo is not None:
+            return
+
+        preview = imageutil.scaled_preview(self._result_image, box)
+        if preview is None:
+            self._result_photo = None
+            self._result_preview_key = key
+            self._result_image_label.configure(image="", text="")
+            self._result_image_label.image = None  # type: ignore[attr-defined]
+            return
+
+        photo = ImageTk.PhotoImage(preview)
+        self._result_photo = photo
+        self._result_preview_key = key
+        self._result_image_label.configure(
+            image=photo, text=_STALE_SUFFIX if stale else ""
+        )
+        self._result_image_label.image = photo  # type: ignore[attr-defined]
 
     def _refresh_source_preview(self) -> None:
         """Rebuild the on-screen source preview for the current box size.

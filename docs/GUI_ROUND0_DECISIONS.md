@@ -4,9 +4,10 @@ Scope: the decisions frozen for the GUI v1 shell, kept short so a future task
 can recover the intent without reading the whole history. This is **not** a UI
 specification; it only records what was decided and why.
 
-Status: GUI-001 (shell) implements the structure below. The Generate / Save
-pipelines and the stale-result rules are **GUI-002+** and are not implemented
-yet.
+Status: GUI-001 (shell) implements the structure below. GUI-002A implements the
+real Generate pipeline, the worker, the Result Preview, the `current` / `stale`
+lifecycle and the positive White-on-black polarity. `Save PNG…` and the
+packaging rounds remain **not implemented**.
 
 ## Toolkit and style
 
@@ -56,8 +57,8 @@ yet.
   the real result are **separate**: resizing a preview only affects the GUI and
   must never modify the source image, the preprocess input or the output
   semantics.
-- In GUI-001 both `Generate` and `Save PNG…` are **disabled**; no real
-  pipeline exists.
+- In GUI-001 both `Generate` and `Save PNG…` were **disabled**. In GUI-002A
+  `Generate` is live; `Save PNG…` is still disabled (GUI-002B).
 
 ## State model (concepts, not a giant enum)
 
@@ -70,14 +71,51 @@ yet.
   an output-affecting parameter change makes it `stale`. A stale result may
   still be **displayed**, but **Save is disabled**. If the parameters return to
   the same semantic configuration, the result may become `current` again.
+  GUI-002A implements this with a **normalized semantic key**
+  (`gui/pipeline.py: GenerationKey`): the comparison is on canonical values,
+  so `Scale = 1` and `Scale = 1.0` are the same configuration, and parameters
+  that cannot affect the output (a hidden `Angle` in Spiral, a hidden `Arms`
+  in Stripe, a hidden `Line width` in Variable width) never invalidate a
+  result.
 - **A new source clears the result outright** — it is never kept as `stale`.
+  GUI-002A drops the stored full-resolution pixels as well as the metadata.
 - **Inputs lock while a job runs:** `Open Image`, `Generate`, `Save PNG` and
   all parameter controls are disabled during a running job.
 - **Single worker job:** at most one generate at a time.
 - **No Cancel in GUI v1.**
-- The worker (GUI-002) does preprocess / geometry / rendering and never touches
-  Tk widgets; the Tk main thread receives the finished result and updates the
-  UI.
+- The worker (GUI-002A) does preprocess / geometry / rendering and never
+  touches Tk widgets; the Tk main thread receives the finished result and
+  updates the UI. Concretely, the hand-off is a `queue.Queue` drained from a
+  `root.after` poll, the single worker thread is a **daemon** (so closing the
+  window mid-job needs no `join` and no cancellation), and a runtime failure
+  is reported as a plain sentence in a message box — never a raw traceback.
+- **Output format frozen in GUI-002A:** a Stripe result is `H × W × 3` RGB
+  with **no alpha**; a Spiral result is `N × N × 4` RGBA whose alpha is
+  exactly the circular support (`255` inside the disc, `0` outside, only those
+  two values), built from the *same* `circular_support` helper the Spiral
+  geometry uses and **never** from the line mask, so every pixel inside the
+  disc — line or background — is fully opaque.
+
+## Render polarity (GUI-002A correction)
+
+- **White on black keeps the source positive.** The white line must grow as the
+  source gets *brighter* (`W_white = P · G`), so a white area stays white and a
+  black area stays black. It is **not** a photographic negative of the
+  black-on-white result.
+- This is implemented at the **application** level, not in the geometry. The
+  variable-width cores keep their single frozen formula `W = P · (1 − G)` and
+  their API; the pipeline simply feeds them the **inverted** grayscale
+  (`preprocess.invert_luminance`) on the Variable + White-on-black path.
+- Applied **after** the crop and the Scale, so the Spiral centred crop, the
+  RGB/mask alignment and the output sizes are untouched. Stripe and Spiral are
+  treated identically.
+- **Black on white is unchanged** (`W = P · (1 − G)` on the raw luminance), and
+  only the grayscale is ever inverted — a `Source-color` result still copies the
+  original Cartesian source pixels.
+- **Fixed width is not affected:** it derives no width from luminance, so a
+  "negative" has no meaning there and both polarities produce identical output.
+- **Alpha is not affected:** it is still decided only by `circular_support`.
+
 
 ## Spiral rectangular source (revised after Windows manual acceptance)
 
@@ -117,14 +155,21 @@ The frozen behaviour is:
   whether the GUI and CLI eventually share the auto-crop is a later discussion.
 
 The output-resolution readout follows the same split (a projection only — no
-image is cropped, resized or transformed in GUI-001): Stripe projects from the
+image is cropped, resized or transformed there): Stripe projects from the
 original `W × H`, Spiral projects from `scaled_size(side, side, scale)` with
 `side = min(W, H)`, still reusing the existing `scaled_size` rounding rule.
 
-For a future **Source-color** Spiral result, the grayscale and RGB paths must
-use the **same** centered square crop box and the **same** Scale; the RGB is
-only the final Cartesian source colour and still never enters the polar
-pipeline.
+GUI-002A performs that crop for real, in exactly this order:
+`source → centered square crop → scale → Spiral geometry`. The crop is applied
+to the grayscale *and* to the Cartesian RGB companion with the **same** box
+and the **same** scale.
+
+For a **Source-color** Spiral result, the grayscale and RGB paths use the
+**same** centered square crop box and the **same** Scale; the RGB is only the
+final Cartesian source colour and still never enters the polar pipeline. In
+GUI-002A this is enforced structurally: `gui/pipeline.py` does not import
+OpenCV, so it cannot unwrap or remap colour even by accident.
+
 
 ## Integration boundary
 
@@ -145,9 +190,11 @@ transparent background, installer or portable EXE.
 
 ## Stage order
 
-1. **GUI Shell** (this round) — layout, controls, state model, Open Image,
+1. **GUI Shell** (GUI-001) — layout, controls, state model, Open Image,
    Source Preview, validation, disabled actions.
-2. **Core integration** (GUI-002) — real Generate / Save, worker, stale result.
+2. **Core integration** (GUI-002A / GUI-002B) — GUI-002A delivered the real
+   Generate pipeline, the single worker, the Result Preview and the
+   `current` / `stale` lifecycle. GUI-002B delivers the Save PNG workflow.
 3. **Windows visual / manual acceptance** (GUI-003) — fonts, DPI, window size,
    file dialog feel, preview proportions.
 4. **Packaging.**

@@ -13,18 +13,22 @@ This module models them as a few small, explicit fields on one
 :class:`GuiState` object plus a handful of pure transition helpers.  There is
 deliberately **no** ``READY_WITH_SOURCE_AND_STALE_RESULT...`` enumeration.
 
-GUI-001 does not run a worker or produce a result yet, but the transitions
-here are the ones GUI-002 will need, so the shape is already right:
+GUI-002A fills in the lifecycle that GUI-001 only sketched:
 
 * loading a new source replaces the old source and **clears** any result
   (a superseded result is dropped, never kept as ``stale``);
-* a result can later be marked ``stale`` when an output-affecting parameter
-  changes, and ``current`` again when the parameters return to the same
-  semantic configuration (that comparison lives in GUI-002);
-* hiding a parameter never changes state -- visibility is a view concern.
+* a result is ``stale`` while an output-affecting parameter differs from the
+  one that produced it, and becomes ``current`` again automatically when the
+  parameters return to the **same semantic configuration** -- including the
+  ``"1"`` / ``"1.0"`` case, because the comparison is done on a normalized
+  :class:`~halftone_playground.gui.pipeline.GenerationKey` rather than on the
+  raw text the user typed;
+* hiding a parameter never changes state -- visibility is a view concern, and
+  the key only ever records parameters that can actually affect the output.
 
 The module knows nothing about widgets or images: a source is represented by
-its path and size only.
+its path and size only, and a result by its size, provenance key and the
+identity of the source it came from.
 """
 
 from __future__ import annotations
@@ -87,16 +91,37 @@ class SourceInfo:
 class ResultInfo:
     """Metadata for one generated result.
 
-    Empty in GUI-001 (no generation yet), but defined now so the state model
-    is complete and GUI-002 has an obvious place to attach a result handle.
-    ``params_fingerprint`` is the semantic configuration that produced the
-    result; GUI-002 compares it to the live parameters to decide
-    ``current`` vs ``stale``.
+    The pixel data itself deliberately does **not** live here: the state model
+    is the small, headless-testable description of *what* exists, while the
+    full-resolution array is owned by the shell.  Keeping the two apart is
+    what lets every lifecycle rule below be tested without Pillow, Tk or a
+    display.
+
+    ``generation_key`` is the normalized semantic configuration that produced
+    this result (see
+    :class:`halftone_playground.gui.pipeline.GenerationKey`).  Comparing it to
+    the live parameters is the whole of the ``current`` / ``stale`` decision.
+    It is typed ``object`` so this module stays free of a pipeline import (and
+    therefore free of numpy) while still round-tripping the key untouched.
+
+    ``source_path`` records which file the result came from, so a result can
+    never be mistaken for one belonging to a different image.  ``mode`` is the
+    Pillow mode of the real output (``"RGB"`` or ``"RGBA"``).
     """
 
     width: int
     height: int
-    params_fingerprint: object = None
+    generation_key: object = None
+    source_path: Optional[Path] = None
+    mode: str = "RGB"
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return (self.width, self.height)
+
+    @property
+    def has_alpha(self) -> bool:
+        return self.mode == "RGBA"
 
 
 @dataclass
@@ -146,18 +171,34 @@ class GuiState:
     def can_generate(self) -> bool:
         """Whether ``Generate`` may be enabled.
 
-        GUI-001 keeps the actual button disabled (no pipeline yet), but the
-        *rule* is expressed here for GUI-002: at least one job at a time, a
-        source must be loaded, and no job may already be running.
+        GUI-002A rule: a source must be loaded, every visible parameter must
+        validate, and no job may already be running.  A rectangular source
+        with ``Mode = Spiral`` is a *legal* configuration (the GUI takes the
+        centered maximum square itself), so it never blocks generation.
+
+        ``params_valid`` is passed in rather than computed here because
+        parameter validation belongs to
+        :mod:`halftone_playground.gui.params`; this module stays the decision
+        about *state*, not about field rules.
         """
         return self.has_source and not self.is_running
+
+    def generate_allowed(self, *, params_valid: bool) -> bool:
+        """``Generate`` eligibility: source + valid params + no running job.
+
+        A thin wrapper over :attr:`can_generate` and ``params_valid`` so the
+        shell has one call to make and the full rule is testable here.
+        """
+        return self.can_generate and params_valid
 
     @property
     def can_save(self) -> bool:
         """Whether ``Save PNG...`` may be enabled.
 
-        Only a ``current`` (non-stale) result is saveable; GUI-001 therefore
-        always reports ``False`` because there is never a result.
+        GUI-002A still does not implement saving, so the shell keeps the
+        button disabled regardless of state.  The *rule* stays here for the
+        round that implements it: only a ``current`` (non-stale) result is
+        saveable.
         """
         return self.has_result and self.result_status == RESULT_CURRENT
 
@@ -187,10 +228,7 @@ class GuiState:
         self.result_status = RESULT_NONE
 
     def set_result(self, result: ResultInfo, *, stale: bool = False) -> None:
-        """Install a result and mark it ``current`` or ``stale``.
-
-        Not exercised by GUI-001; present so the shape is ready for GUI-002.
-        """
+        """Install a result and mark it ``current`` or ``stale``."""
         self.result = result
         self.result_status = RESULT_STALE if stale else RESULT_CURRENT
 
@@ -211,6 +249,46 @@ class GuiState:
         """Promote a stale result back to current (params returned to match)."""
         if self.result is not None:
             self.result_status = RESULT_CURRENT
+
+    def sync_result_status(self, current_key: object) -> bool:
+        """Re-derive ``current`` / ``stale`` from a live generation key.
+
+        This is the single entry point GUI-002A uses after *any* output-
+        affecting change, and it is deliberately a *reconciliation* rather
+        than a pair of manual ``mark_*`` calls: it compares
+        :attr:`ResultInfo.generation_key` with ``current_key`` and sets the
+        status to match.  That gives the "auto-revert to current" rule for
+        free -- moving ``Scale`` from ``1`` to ``1.3`` and back to ``1`` ends
+        with the result ``current`` again, with no special case anywhere.
+
+        Equality is plain ``==`` on the keys, which is exactly why the key is
+        normalized before it is stored: the comparison must not be confused by
+        the *text* the user typed (``"1"`` vs ``"1.0"``).
+
+        Returns ``True`` when the status ended up ``current``.  With no result
+        installed it is a no-op (and returns ``False``) -- there is nothing to
+        be stale about.
+        """
+        if self.result is None:
+            self.result_status = RESULT_NONE
+            return False
+        if self.result.generation_key == current_key:
+            self.result_status = RESULT_CURRENT
+            return True
+        self.result_status = RESULT_STALE
+        return False
+
+    def belongs_to_source(self, path: Path) -> bool:
+        """Whether the installed result came from ``path``.
+
+        Guard for the worker hand-off: when a finished job is delivered, the
+        result must still belong to the source that is currently loaded.
+        """
+        return (
+            self.result is not None
+            and self.result.source_path is not None
+            and Path(self.result.source_path) == Path(path)
+        )
 
     def begin_job(self) -> None:
         """Enter the single-job ``running`` state."""

@@ -16,7 +16,13 @@ source image's own colour on white -- without touching the mask.
 
 from __future__ import annotations
 
-from .preprocess import resize_grayscale, resize_rgb, scaled_size
+from .preprocess import (
+    circular_support,
+    invert_luminance,
+    resize_grayscale,
+    resize_rgb,
+    scaled_size,
+)
 from .render import (
     render_black_on_white,
     render_source_color_on_white,
@@ -31,6 +37,8 @@ __version__ = "0.0.1"
 __all__ = [
     "GRADIENT_SIZE",
     "__version__",
+    "circular_support",
+    "invert_luminance",
     "make_gradient",
     "render_black_on_white",
     "render_source_color_on_white",

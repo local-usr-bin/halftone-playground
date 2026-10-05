@@ -90,6 +90,7 @@ import math
 import cv2
 import numpy as np
 
+from .preprocess import circular_support
 from .stripe import stripe_fixed_mask, stripe_mask
 
 __all__ = ["spiral_fixed_mask", "spiral_mask"]
@@ -396,16 +397,19 @@ def _circular_support(
 ) -> np.ndarray:
     """Boolean disc of radius ``support_radius`` around ``center``.
 
-    Pixel ``(y, x)`` is inside when its *centre* distance to ``center`` is
-    ``<= support_radius``.  Integer pixel coordinates keep the disc exactly
-    mirror-symmetric; ``warpPolar`` is never trusted to decide the product's
-    disc boundary.
+    Thin alias of :func:`halftone_playground.preprocess.circular_support`.
+
+    The disc formula used to live here as the single definition.  GUI-002A
+    needs the exact same disc to build the Spiral alpha channel in the result
+    pipeline, so the formula was moved to :mod:`halftone_playground.preprocess`
+    and this name is kept as a delegating alias: there is still exactly **one**
+    implementation in the project, and existing callers -- including the
+    geometry below and the tests that reach for this private helper -- keep
+    working unchanged.
+
+    This is a refactor, not an algorithm change: the arithmetic is identical.
     """
-    coords = np.arange(side, dtype=np.float64)
-    dx = coords - center[0]
-    dy = coords - center[1]
-    distance_squared = dy[:, None] ** 2 + dx[None, :] ** 2
-    return distance_squared <= support_radius * support_radius
+    return circular_support(side, center, support_radius)
 
 
 # --------------------------------------------------------------------------

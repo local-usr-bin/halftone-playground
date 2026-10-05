@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from halftone_playground import resize_grayscale, scaled_size, stripe_mask
+from halftone_playground.preprocess import circular_support, invert_luminance
 
 
 def _constant(value: int, height: int, width: int) -> np.ndarray:
@@ -290,3 +291,106 @@ def test_scaled_pipeline_is_resize_then_core() -> None:
     via_pipeline = stripe_mask(scaled, 16, 90.0)
     direct = stripe_mask(_constant(100, 16, 1024), 16, 90.0)
     assert np.array_equal(via_pipeline, direct)
+
+
+# --------------------------------------------------------------------------
+# circular_support: the one shared disc definition (GUI-002A refactor)
+# --------------------------------------------------------------------------
+#
+# GUI-002A moved the Spiral disc formula out of ``spiral.py`` into this module
+# so the GUI result pipeline can build the Spiral alpha channel from the very
+# same definition.  These tests pin the behaviour that must NOT have changed.
+
+
+def _reference_disc(
+    side: int, center: tuple[float, float], support_radius: float
+) -> np.ndarray:
+    """Independent, inline re-statement of the original disc formula."""
+    coords = np.arange(side, dtype=np.float64)
+    dx = coords - center[0]
+    dy = coords - center[1]
+    distance_squared = dy[:, None] ** 2 + dx[None, :] ** 2
+    return distance_squared <= support_radius * support_radius
+
+
+@pytest.mark.parametrize("side", [2, 3, 7, 16, 33, 64, 512])
+def test_circular_support_matches_the_original_formula(side: int) -> None:
+    """Byte-for-byte identical to the formula that used to live in spiral.py."""
+    center = ((side - 1) / 2.0, (side - 1) / 2.0)
+    support_radius = (side - 1) / 2.0
+    got = circular_support(side, center, support_radius)
+    expected = _reference_disc(side, center, support_radius)
+    assert got.dtype == np.bool_
+    assert got.shape == (side, side)
+    assert np.array_equal(got, expected)
+
+
+def test_circular_support_is_the_single_definition() -> None:
+    """``spiral._circular_support`` must delegate, not reimplement.
+
+    The Spiral module keeps a private alias for its own callers and for the
+    existing geometry tests.  It has to be a *thin* delegation: if someone
+    reintroduced a second copy of the formula, the two would eventually drift
+    apart -- the exact failure this refactor exists to prevent.
+    """
+    from halftone_playground import spiral
+
+    for side in (2, 5, 16, 100, 333):
+        center = ((side - 1) / 2.0, (side - 1) / 2.0)
+        support_radius = (side - 1) / 2.0
+        alias = spiral._circular_support(side, center, support_radius)
+        shared = circular_support(side, center, support_radius)
+        assert np.array_equal(alias, shared)
+
+
+def test_circular_support_disc_is_mirror_symmetric() -> None:
+    """The disc stays exactly symmetric under both flips (odd and even side)."""
+    for side in (7, 8, 16, 33):
+        center = ((side - 1) / 2.0, (side - 1) / 2.0)
+        disc = circular_support(side, center, (side - 1) / 2.0)
+        assert np.array_equal(disc, disc[::-1, :])
+        assert np.array_equal(disc, disc[:, ::-1])
+
+
+def test_circular_support_centre_is_inside_and_corner_is_outside() -> None:
+    side = 64
+    center = ((side - 1) / 2.0, (side - 1) / 2.0)
+    disc = circular_support(side, center, (side - 1) / 2.0)
+    assert bool(disc[side // 2, side // 2]) is True
+    assert bool(disc[0, 0]) is False
+    assert bool(disc[0, side - 1]) is False
+
+
+# --------------------------------------------------------------------------
+# invert_luminance: the shared white-on-black polarity helper
+# --------------------------------------------------------------------------
+
+
+def test_invert_luminance_is_the_exact_uint8_complement() -> None:
+    gray = np.array([[0, 1, 127, 128, 254, 255]], dtype=np.uint8)
+    out = invert_luminance(gray)
+    assert out.dtype == np.uint8
+    assert np.array_equal(out, np.array([[255, 254, 128, 127, 1, 0]], np.uint8))
+
+
+def test_invert_luminance_is_an_involution_and_never_mutates() -> None:
+    gray = np.arange(256, dtype=np.uint8).reshape(16, 16)
+    original = gray.copy()
+    once = invert_luminance(gray)
+    assert np.array_equal(gray, original)
+    assert once is not gray
+    assert np.array_equal(invert_luminance(once), original)
+
+
+def test_invert_luminance_preserves_shape_and_dtype() -> None:
+    for shape in ((1, 1), (5, 7), (33, 64)):
+        out = invert_luminance(np.zeros(shape, np.uint8))
+        assert out.shape == shape
+        assert out.dtype == np.uint8
+
+
+def test_invert_luminance_rejects_a_bad_input() -> None:
+    with pytest.raises(ValueError):
+        invert_luminance(np.zeros((4, 4), np.float32))
+    with pytest.raises(ValueError):
+        invert_luminance(np.zeros((4,), np.uint8))

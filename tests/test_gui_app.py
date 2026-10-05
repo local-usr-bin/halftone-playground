@@ -329,19 +329,250 @@ class TestSpiralRectangularSource:
 
 
 # --------------------------------------------------------------------------
-# generate / save remain inert
+# generate eligibility / save remains inert (GUI-002A)
 # --------------------------------------------------------------------------
 
 
-class TestActionsInert:
-    def test_generate_and_save_stay_disabled_with_source(self, app, image_factory):
+class TestGenerateEligibility:
+    def test_generate_enabled_once_a_source_is_loaded(self, app, image_factory):
         app._load_source(image_factory("s.png", 64, 64))
         app.root.update_idletasks()
-        assert str(app._generate_btn["state"]) == "disabled"
+        assert str(app._generate_btn["state"]) == "normal"
+
+    def test_save_stays_disabled(self, app, image_factory):
+        # Save PNG is GUI-002B; GUI-002A must keep it honestly disabled.
+        app._load_source(image_factory("s.png", 64, 64))
+        app.root.update_idletasks()
         assert str(app._save_btn["state"]) == "disabled"
 
-    def test_no_result_is_ever_produced(self, app, image_factory):
+    def test_generate_disabled_without_a_source(self, app):
+        assert str(app._generate_btn["state"]) == "disabled"
+
+    def test_generate_disabled_while_a_job_runs(self, app, image_factory):
+        app._load_source(image_factory("s.png", 64, 64))
+        app.root.update_idletasks()
+        app.state.begin_job()
+        app.refresh()
+        assert str(app._generate_btn["state"]) == "disabled"
+        # ...and every other input locks too.
+        assert str(app._mode_box["state"]) == "disabled"
+        assert str(app._open_btn["state"]) == "disabled"
+
+    def test_no_result_until_generate_runs(self, app, image_factory):
         app._load_source(image_factory("s.png", 64, 64))
         app.root.update_idletasks()
         assert app.state.result is None
         assert app.state.result_status == gs.RESULT_NONE
+        assert app._result_image_label.cget("text") == "No result yet"
+
+
+# --------------------------------------------------------------------------
+# the real Generate pipeline (GUI-002A)
+# --------------------------------------------------------------------------
+
+
+def _pump_until_done(app, timeout: float = 20.0) -> None:
+    """Run the Tk event loop until the worker has delivered its outcome.
+
+    ``root.update()`` dispatches the ``after`` poll callback that drains the
+    worker queue -- the same path a real user's idle event loop takes.
+
+    The loop is driven by the *subject's own* signal: it stops once the worker
+    is no longer busy AND, for a successful job, a result has been installed.
+    A failure leaves ``result`` as ``None``, so the caller can also wait for a
+    failure by checking ``state.is_running`` instead.
+    """
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        app.root.update()
+        if not app._worker.busy and not app.state.is_running:
+            # One more dispatch so a just-queued outcome is handled.
+            app.root.update()
+            if not app._worker.busy and not app.state.is_running:
+                return
+        time.sleep(0.01)
+    raise AssertionError("generation did not finish")
+
+
+@pytest.fixture()
+def rect_source(tmp_path):
+    """A rectangular RGB source; every channel varies with position."""
+    ys, xs = np.mgrid[0:60, 0:100]
+    arr = np.dstack(
+        [
+            (xs * 255 // 99).astype(np.uint8),
+            (ys * 255 // 59).astype(np.uint8),
+            np.full((60, 100), 7, np.uint8),
+        ]
+    )
+    path = tmp_path / "rect.png"
+    Image.fromarray(arr, "RGB").save(path)
+    return path
+
+
+class TestGeneratePipeline:
+    def test_stripe_stores_a_full_resolution_rgb_result(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+
+        result = app.state.result
+        assert result is not None
+        assert result.mode == "RGB"
+        assert result.size == (100, 60)
+        # The stored pixels are the real output at full resolution...
+        assert app._result_pixels.shape == (60, 100, 3)
+        assert app._result_pixels.dtype == np.uint8
+
+    def test_spiral_stores_a_square_rgba_result(self, app, rect_source):
+        app.params.mode = gp.MODE_SPIRAL
+        app._sync_mode_state()
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+
+        result = app.state.result
+        assert result is not None
+        assert result.mode == "RGBA"
+        assert result.size == (60, 60)
+        assert app._result_pixels.shape == (60, 60, 4)
+
+    def test_result_preview_shows_a_scaled_copy_not_the_result(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        app.root.update()
+
+        # A preview bitmap exists, and the stored result is untouched by it.
+        assert app._result_photo is not None
+        assert app._result_pixels.shape == (60, 100, 3)
+        assert app._result_image_label.cget("text") == ""
+
+    def test_preview_never_replaces_the_full_resolution_result(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        before = app._result_pixels.copy()
+        app._schedule_preview_refresh()
+        app.root.update()
+        assert np.array_equal(app._result_pixels, before)
+
+    def test_result_is_current_right_after_generating(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        assert app.state.result_status == gs.RESULT_CURRENT
+
+    def test_save_remains_disabled_after_a_result(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        assert str(app._save_btn["state"]) == "disabled"
+
+    def test_inputs_unlock_after_the_job_finishes(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        assert str(app._mode_box["state"]) == "readonly"
+        assert str(app._generate_btn["state"]) == "normal"
+
+
+class TestResultLifecycleInShell:
+    def test_changing_scale_marks_the_result_stale(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        assert app.state.result_status == gs.RESULT_CURRENT
+
+        app._param_rows["scale"]["var"].set("1.3")
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_STALE
+
+    def test_returning_to_the_same_value_restores_current(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        app._param_rows["scale"]["var"].set("1.3")
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_STALE
+        app._param_rows["scale"]["var"].set("1")
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_CURRENT
+
+    def test_typing_one_point_zero_keeps_the_result_current(self, app, rect_source):
+        """The semantic-key requirement, through the real widget path."""
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        app._param_rows["scale"]["var"].set("1.0")
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_CURRENT
+
+    def test_hidden_parameter_change_keeps_the_result_current(self, app, rect_source):
+        app.params.mode = gp.MODE_SPIRAL
+        app._sync_mode_state()
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        # Angle is hidden in Spiral, so editing it must not invalidate results.
+        app._param_rows["angle"]["var"].set("45")
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_CURRENT
+
+    def test_stale_result_keeps_being_displayed(self, app, rect_source):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        stored = app._result_pixels.copy()
+        app._param_rows["scale"]["var"].set("1.3")
+        app.root.update()
+        app._schedule_preview_refresh()
+        app.root.update()
+        assert app.state.result_status == gs.RESULT_STALE
+        assert app._result_pixels is not None
+        assert np.array_equal(app._result_pixels, stored)
+
+    def test_loading_a_new_source_clears_the_result(self, app, rect_source, image_factory):
+        app._load_source(rect_source)
+        app._on_generate()
+        _pump_until_done(app)
+        assert app.state.result is not None
+
+        app._load_source(image_factory("other.png", 32, 32))
+        app.root.update()
+        assert app.state.result is None
+        assert app.state.result_status == gs.RESULT_NONE
+        assert app._result_pixels is None
+        assert app._result_image_label.cget("text") == "No result yet"
+
+
+class TestGenerateFailure:
+    def test_failure_shows_a_message_and_no_result(self, app, tmp_path, monkeypatch):
+        """A runtime failure is reported on the main thread, without a result."""
+        shown = {}
+
+        def fake_error(title, message, **kwargs):
+            shown["title"] = title
+            shown["message"] = message
+
+        monkeypatch.setattr(
+            "halftone_playground.gui.app.messagebox.showerror", fake_error
+        )
+
+        # Load a real source, then delete it so the worker cannot read it.
+        path = tmp_path / "gone.png"
+        Image.fromarray(np.full((32, 32, 3), 100, np.uint8), "RGB").save(path)
+        app._load_source(path)
+        path.unlink()
+
+        app._on_generate()
+        _pump_until_done(app)
+
+        assert app.state.result is None
+        assert shown.get("title") == "Cannot generate"
+        assert "gone.png" in shown.get("message", "")
+        assert "Traceback" not in shown.get("message", "")
+        # ...and the app is usable again.
+        assert app.state.is_running is False

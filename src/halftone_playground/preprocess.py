@@ -27,6 +27,26 @@ Product rules frozen for this round:
 * no resource management happens here: computing a target size never
   allocates an image, and if a requested output is too large for the
   machine, that is left to the ordinary failure of the allocation itself.
+
+One further *shared pure helper* lives here because more than one layer now
+needs it: :func:`circular_support`, the disc predicate of the Spiral output.
+It used to be a private helper inside :mod:`halftone_playground.spiral`, but
+the GUI result pipeline needs the very same disc to build the Spiral alpha
+channel.  Rather than let a second copy of the formula appear in the GUI, the
+formula was **moved here unchanged** and the Spiral module keeps a thin alias,
+so there is exactly one definition in the project.  This is a refactor, not an
+algorithm change: the arithmetic is byte-for-byte the same.
+
+A second shared pure helper lives here for the same reason:
+:func:`invert_luminance`.  The *variable-width* geometry maps width linearly
+from luminance as ``W = P * (1 - G)``, which is the black-on-white convention
+(black source -> widest line).  The white-on-black product semantics require
+the opposite: the white line must grow with the source's brightness
+(``W_white = P * G``).  That is expressed by inverting the **already
+preprocessed** grayscale before it reaches the geometry, so the frozen
+``stripe_mask`` / ``spiral_mask`` width formula and API stay exactly as they
+are.  The inversion itself is one line of arithmetic, so it is defined here
+once instead of being re-typed in the GUI pipeline.
 """
 
 from __future__ import annotations
@@ -36,7 +56,13 @@ import math
 import numpy as np
 from PIL import Image
 
-__all__ = ["scaled_size", "resize_grayscale", "resize_rgb"]
+__all__ = [
+    "scaled_size",
+    "resize_grayscale",
+    "resize_rgb",
+    "circular_support",
+    "invert_luminance",
+]
 
 try:  # Pillow >= 9.1
     _BICUBIC = Image.Resampling.BICUBIC
@@ -189,6 +215,83 @@ def resize_rgb(rgb: np.ndarray, image_scale: float) -> np.ndarray:
     image = Image.fromarray(rgb, mode="RGB")
     resized = image.resize((target_width, target_height), resample=_BICUBIC)
     return np.array(resized, dtype=np.uint8)
+
+
+def circular_support(
+    side: int, center: tuple[float, float], support_radius: float
+) -> np.ndarray:
+    """Boolean disc of radius ``support_radius`` around ``center``.
+
+    Pixel ``(y, x)`` is inside when its *centre* distance to ``center`` is
+    ``<= support_radius``.  Integer pixel coordinates keep the disc exactly
+    mirror-symmetric; ``warpPolar`` is never trusted to decide the product's
+    disc boundary.
+
+    This is the **single** definition of the Spiral disc in the project.  It
+    is used both by the Spiral geometry (to mask the inverse-warped mask) and
+    by the GUI result pipeline (to build the Spiral alpha channel), so the
+    visible disc and the opaque alpha region can never disagree.
+
+    Parameters
+    ----------
+    side:
+        The square side ``N`` of the Cartesian canvas.
+    center:
+        ``(cx, cy)`` in pixel coordinates; Spiral passes
+        ``((N - 1) / 2, (N - 1) / 2)``.
+    support_radius:
+        Disc radius in pixels; Spiral passes ``(N - 1) / 2``.
+
+    Returns
+    -------
+    numpy.ndarray
+        An ``N x N`` ``bool`` array that is ``True`` inside the disc.
+    """
+    coords = np.arange(side, dtype=np.float64)
+    dx = coords - center[0]
+    dy = coords - center[1]
+    distance_squared = dy[:, None] ** 2 + dx[None, :] ** 2
+    return distance_squared <= support_radius * support_radius
+
+
+def invert_luminance(gray: np.ndarray) -> np.ndarray:
+    """Return the luminance inversion ``255 - gray`` of a ``uint8`` image.
+
+    This is the **white-on-black** product correction.  The variable-width
+    geometry cores map a source luminance ``G in [0, 1]`` to a line width
+
+        W = P * (1 - G)
+
+    i.e. they are written for the *black-on-white* convention, where a dark
+    source produces a wide (black) line.  In the white-on-black variant the
+    line is white, so its width must instead grow with the source's
+    brightness -- the equivalent statement is ``W_white = P * G``.  Feeding the
+    geometry the inverted luminance makes the frozen formula produce exactly
+    that, so the cores keep their single, unchanged width definition.
+
+    Parameters
+    ----------
+    gray:
+        A non-empty 2-D ``uint8`` array (height, width).
+
+    Returns
+    -------
+    numpy.ndarray
+        A new 2-D ``uint8`` array of the same shape with every pixel replaced
+        by ``255 - value``.  Black (``0``) becomes white (``255``) and vice
+        versa; a mid-grey ``128`` becomes ``127``.  The input array is never
+        modified and the result is always a fresh allocation.
+
+    Notes
+    -----
+    This is *not* a renderer concern and it is deliberately not part of the
+    geometry cores: it is an application-level decision about which way round
+    the source is interpreted, applied to the grayscale **after** the source
+    has been cropped and scaled.  The fixed-width and source-colour paths never
+    call it, because neither derives a line width from luminance.
+    """
+    _validate_gray(gray)
+    return (np.uint8(255) - gray).astype(np.uint8)
 
 
 def _scaled_axis(original: int, scale: float) -> int:
