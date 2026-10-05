@@ -195,12 +195,17 @@ class GuiState:
     def can_save(self) -> bool:
         """Whether ``Save PNG...`` may be enabled.
 
-        GUI-002A still does not implement saving, so the shell keeps the
-        button disabled regardless of state.  The *rule* stays here for the
-        round that implements it: only a ``current`` (non-stale) result is
-        saveable.
+        GUI-002B rule: saving is allowed only for a ``current`` (non-stale)
+        result while the worker is **idle**.  A ``none`` result is not
+        saveable, a ``stale`` result is not saveable, and a running job locks
+        saving like every other input -- all three cases collapse into this one
+        predicate, so the button and the save callback share a single rule.
         """
-        return self.has_result and self.result_status == RESULT_CURRENT
+        return (
+            self.has_result
+            and self.result_status == RESULT_CURRENT
+            and not self.is_running
+        )
 
     @property
     def inputs_locked(self) -> bool:

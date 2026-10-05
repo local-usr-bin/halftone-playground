@@ -1,10 +1,11 @@
-"""Tkinter / ttk GUI shell for halftone-playground (GUI-001 + GUI-002A).
+"""Tkinter / ttk GUI shell for halftone-playground (GUI-001 + GUI-002A + GUI-002B).
 
 This is a *thin* entry point, exactly like :mod:`halftone_playground.cli`.  It
 owns widgets and event wiring only; every decision that can be made without a
 toolkit lives in :mod:`halftone_playground.gui.params`,
-:mod:`halftone_playground.gui.state` and
-:mod:`halftone_playground.gui.pipeline`, the image display scaling lives in
+:mod:`halftone_playground.gui.state`,
+:mod:`halftone_playground.gui.pipeline` and
+:mod:`halftone_playground.gui.saving`, the image display scaling lives in
 :mod:`halftone_playground.gui.imageutil`, and the concurrency lives in
 :mod:`halftone_playground.gui.worker`.
 
@@ -38,12 +39,25 @@ What GUI-002A adds
   with no alpha, Spiral results are ``N x N x 4`` whose alpha is exactly the
   circular support (never derived from the line mask).
 
-What GUI-002A still does **not** do
+What GUI-002B adds
+------------------
+
+* a real **``Save PNG...``**: the button is enabled exactly for a ``current``
+  result while the worker is idle, and writes the stored **full-resolution**
+  result through a native Save As dialog (``<source_stem>_halftone.png`` in the
+  source's directory, PNG only).  Saving never re-runs the pipeline -- it
+  encodes the pixels that already exist (see
+  :mod:`halftone_playground.gui.saving`).  Success is a short inline note; a
+  cancelled dialog is a strict no-op; a write failure is a friendly message box
+  that leaves the current result intact and the button usable again.
+
+What GUI-002B still does **not** do
 -----------------------------------
 
-* no real ``Save PNG...`` (the button stays disabled -- that is GUI-002B);
 * no ``Cancel``, no job queue, no second worker, no batch processing, no
-  history, no preset manager, no crop UI, no zoom / pan, no theming.
+  history, no preset manager, no crop UI, no zoom / pan, no theming, no
+  automatic saving, no formats other than PNG and no atomic-write/backup
+  subsystem.
 
 Threading contract
 ------------------
@@ -66,7 +80,7 @@ from typing import Optional
 
 from PIL import Image, ImageTk
 
-from . import imageutil, params as gui_params
+from . import imageutil, params as gui_params, saving
 from .pipeline import GenerationKey, GenerationRequest
 from .state import GuiState, ResultInfo, SourceInfo
 from .worker import GenerationJob, GenerationWorker, WorkerOutcome
@@ -338,7 +352,7 @@ class HalftoneApp:
         )
         row += 1
 
-        # Actions (both disabled in GUI-001; wired for GUI-002) -----------
+        # Actions (Generate live since GUI-002A, Save live since GUI-002B) ---
         actions = ttk.Frame(controls)
         actions.grid(row=row, column=0, columnspan=2, sticky="ew")
         actions.columnconfigure(0, weight=1)
@@ -572,9 +586,60 @@ class HalftoneApp:
         self._ensure_polling()
 
     def _on_save(self) -> None:
-        # GUI-002A: still no Save implementation.  The button is disabled, so
-        # this is a defensive no-op rather than a stub (Save PNG is GUI-002B).
-        pass
+        """Write the current full-resolution result to a PNG file.
+
+        The Save button is only enabled for a ``current`` result while the
+        worker is idle; the guard is repeated here so this callback can never
+        write in an invalid state even if it were reached another way.
+
+        The pipeline is **not** touched: the stored multi-megapixel result
+        pixels are encoded as they are (see
+        :mod:`halftone_playground.gui.saving`), never re-generated and never
+        taken from the scaled-down Result Preview.  A cancelled dialog is a
+        strict no-op -- no file, no result/status change, no message.
+        """
+        if not self.state.can_save:
+            return
+        result = self.state.result
+        pixels = self._result_pixels
+        if result is None or pixels is None:
+            return
+
+        source = self.state.source
+        initial_dir = str(source.path.parent) if source is not None else ""
+        initial_name = (
+            saving.default_save_name(source.path)
+            if source is not None
+            else saving.DEFAULT_SAVE_NAME
+        )
+
+        path_str = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save PNG",
+            initialdir=initial_dir,
+            initialfile=initial_name,
+            defaultextension=saving.PNG_SUFFIX,
+            filetypes=[("PNG", saving.PNG_GLOB)],
+        )
+        if not path_str:
+            # Cancel / dismiss: strict no-op.  There is nothing to tell the
+            # user, so no "save cancelled" dialog is shown either.
+            return
+
+        try:
+            saving.save_png(pixels, result.mode, Path(path_str))
+        except saving.SaveError as exc:
+            # A real write failure must never be reported as a generate
+            # failure, and must leave the result usable so the user can simply
+            # try again.  Nothing was written, so there is no false success.
+            self._show_error("Cannot save PNG", str(exc))
+            return
+
+        # Success: a short inline note is enough (no success message box).  The
+        # result, its key, the preview and the current/stale status are all
+        # untouched, so Save stays available for a further write.
+        self.state.status_message = "Saved PNG."
+        self.refresh()
 
     # ------------------------------------------------------------------
     # generation worker plumbing
@@ -813,9 +878,9 @@ class HalftoneApp:
 
         ``Generate`` is enabled exactly when the full eligibility rule holds
         (source loaded + parameters valid + nothing running).
-        ``Save PNG...`` stays disabled in GUI-002A: saving is GUI-002B, and
-        showing a live button that does nothing would be worse than an
-        honestly disabled one.
+        ``Save PNG...`` is enabled exactly when there is a ``current`` result
+        and no job is running (GUI-002B): a ``none`` or ``stale`` result, or a
+        running job, disables it.
         """
         locked = self.state.inputs_locked
         input_state = "disabled" if locked else "normal"
@@ -830,7 +895,9 @@ class HalftoneApp:
         self._generate_btn.configure(
             state="normal" if self._generate_allowed() else "disabled"
         )
-        self._save_btn.configure(state="disabled")
+        self._save_btn.configure(
+            state="normal" if self.state.can_save else "disabled"
+        )
 
     def _refresh_result_preview(self) -> None:
         """Rebuild the on-screen result preview from the real full-res result.

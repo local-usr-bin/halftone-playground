@@ -182,6 +182,20 @@ class TestJob:
         s.mark_result_stale()
         assert s.can_save is False
 
+    def test_cannot_save_while_a_job_runs(self):
+        # GUI-002B: a running job locks Save like every other input, and the
+        # button returns as soon as the job finishes.
+        s = gs.GuiState()
+        s.set_source(_source())
+        s.set_result(gs.ResultInfo(64, 64))
+        assert s.can_save is True
+
+        s.begin_job()
+        assert s.can_save is False
+
+        s.end_job()
+        assert s.can_save is True
+
     def test_stale_result_is_still_displayable(self):
         # Stale means "cannot save", not "cannot show".
         s = gs.GuiState()
