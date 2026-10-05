@@ -44,18 +44,18 @@ the Cartesian source image, via the existing
 (and `python -m halftone_playground`) wires the existing cores and renderers
 into a single-image tool. See the [CLI](#cli) section below.
 
-**A first GUI shell is implemented (GUI-001), and a real generation pipeline
-now runs in it (GUI-002A).** A plain Tkinter/ttk window (Controls on the left,
-Source / Result previews on the right) can open an image, show a source
-preview, validate parameters and **Generate** the real full-resolution result
-on a background worker. The GUI accepts a rectangular source for Spiral and
-performs the centered maximum-square crop itself. `Save PNG…` is still
-disabled (that is GUI-002B). See the [GUI](#gui) section below and
+**A first GUI shell is implemented (GUI-001), a real generation pipeline now
+runs in it (GUI-002A), and its results can be saved (GUI-002B).** A plain
+Tkinter/ttk window (Controls on the left, Source / Result previews on the
+right) can open an image, show a source preview, validate parameters,
+**Generate** the real full-resolution result on a background worker, and
+**Save PNG…** it. The GUI accepts a rectangular source for Spiral and performs
+the centered maximum-square crop itself. See the [GUI](#gui) section below and
 [`docs/GUI_ROUND0_DECISIONS.md`](docs/GUI_ROUND0_DECISIONS.md) for the frozen
 GUI decisions.
 
-Not implemented yet: the GUI Save PNG workflow, transparency editing beyond the
-Spiral disc, custom RGB backgrounds, batch processing.
+Not implemented yet: transparency editing beyond the Spiral disc, custom RGB
+backgrounds, batch processing.
 
 ## Stripe parameters
 
@@ -482,9 +482,24 @@ What **GUI-002A** adds:
   `queue.Queue` drained from an `after` poll, and the worker thread is a daemon
   so closing the window mid-job is safe.
 
+What **GUI-002B** adds:
+
+- a real **`Save PNG…`** button. It is enabled exactly when a result is
+  `current` and no job is running (`none`, `stale` or a running generation
+  leaves it disabled), and writes the **stored full-resolution result** to a
+  PNG through the native Save As dialog (defaulting to
+  `<source_stem>_halftone.png` in the source's directory);
+- saving **never re-runs** the pipeline — no preprocess, geometry or renderer,
+  and never the scaled-down Result Preview; it encodes the pixels that already
+  exist;
+- **PNG only** (the suffix is case-insensitive). A `Stripe` result is written as
+  a 3-channel **RGB** PNG with no alpha; a `Spiral` result is written as a
+  4-channel **RGBA** PNG whose alpha is the circular support, so the four
+  corners outside the disc stay transparent. A cancelled dialog is a strict
+  no-op, and the current result is left intact even if a write fails.
+
 What this round deliberately does **not** do (later rounds):
 
-- `Save PNG…` is present but still **disabled** — saving is GUI-002B;
 - no `Cancel`, no job queue, no second worker, no batch processing, no history,
   no preset manager, no crop UI, no zoom / pan, no theming;
 - no packaging, no installer, no portable build.
