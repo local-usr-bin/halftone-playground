@@ -1,0 +1,12 @@
+# Packaging-only toolchain for the Windows onedir build.
+#
+# These are the PyInstaller build tools themselves -- NOT application
+# runtime dependencies. numpy / Pillow / opencv-python-headless / pytest
+# belong to the project build environment that this toolchain runs inside,
+# so they are deliberately not pinned here.
+#
+# Install into a dedicated build environment:
+#     python -m pip install -r packaging/requirements-build.txt
+
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
