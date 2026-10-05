@@ -58,11 +58,87 @@ The script will:
 3. Refuse to run if `-OutputRoot` is inside the repository, or already exists
    and is not empty. **It never recursively deletes an existing directory.**
 4. Create `dist\`, `build\` and `spec\` under the output root.
-5. Build the onedir/windowed bundle and report the candidate path, the EXE
-   SHA-256, and the total bundle size.
+5. Build the onedir/windowed bundle.
+6. Remove the unused OpenCV FFmpeg videoio plugin (see below).
+7. Verify the six Conda transitive runtime DLLs were auto-collected (see below).
+8. Report the candidate path, the EXE SHA-256, and the total bundle size
+   (measured **after** the prune).
 
 Any version mismatch stops the build. The script will not upgrade or downgrade
 packages for you.
+
+## Automatic Conda DLL resolution (no manual PATH setup)
+
+The script derives `<env>\Library\bin` from the build interpreter's `sys.prefix`
+and **prepends it to the current process PATH for the duration of the build**.
+Conda keeps several Windows runtime DLLs there instead of next to the extension
+modules that link them, and PyInstaller resolves *transitive* DLL dependencies
+through the process PATH. Hardening the PATH inside the script means PyInstaller
+reliably collects:
+
+```
+LIBBZ2.dll, ffi.dll, libcrypto-3-x64.dll, libexpat.dll,
+liblzma.dll, libssl-3-x64.dll
+```
+
+(dependencies of `_bz2`, `_ctypes`, `_ssl`, `pyexpat` and `_lzma`).
+
+Scope is strictly the build process and its children. The original PATH is
+restored afterwards — **success or failure** — so a failed build never leaves a
+modified environment behind. The script never modifies the Windows user or
+system PATH, the registry, or Conda configuration, and does not persist any
+environment variable.
+
+**You do not need to modify PATH yourself.** The script is self-sufficient: run
+it from any shell, with the build environment's Python selected, and it will
+establish the complete dependency-resolution environment on its own. (If the
+caller *has* already put `Library\bin` on PATH, the script reports that and
+still works.)
+
+These six DLLs must be found by **ordinary binary dependency analysis**. Do not
+add them as explicit `--add-binary` entries — if that were ever necessary it
+would mean the PATH hardening had regressed. After the build the script
+verifies all six are present in `_internal\` and stops if any is missing.
+
+## Unused OpenCV FFmpeg videoio plugin is pruned
+
+The frozen runtime uses **opencv-python-headless 4.14.0.94**. Its Windows wheel
+bundles a runtime-loaded videoio plugin:
+
+```
+_internal\cv2\opencv_videoio_ffmpeg*.dll
+```
+
+halftone-playground:
+
+- does **not** read video,
+- does **not** write video,
+- does **not** use OpenCV `videoio` / FFmpeg,
+- uses OpenCV only for the image / geometry capabilities it actually needs —
+  for example `cv2.warpPolar` in the Spiral renderer.
+
+Human functional acceptance (R1A) confirmed that removing this DLL leaves
+Stripe Generate, Spiral Variable, Spiral Fixed, Spiral Source color and Spiral
+PNG export ("Save") all working normally.
+
+The build script therefore removes this unused plugin **after** PyInstaller has
+finished collecting. Because the toolchain is frozen, the script expects
+**exactly one** match; `0` or `>1` matches stops the build rather than silently
+continuing, so a changed release layout is re-audited instead of assumed.
+
+> If video input/output is ever added to the project, this prune decision must
+> be re-evaluated.
+
+### Technical basis
+
+`opencv_videoio_ffmpeg*.dll` is a **runtime-loaded** OpenCV `videoio` plugin.
+When it is absent, the rest of OpenCV keeps working; only FFmpeg-based video
+decode/encode is lost. This is documented upstream in the OpenCV / opencv-python
+project (see the `opencv-python` repository's notes on the bundled FFmpeg
+plugin).
+
+This section records the engineering rationale for the reproducible build only.
+It is **not** a licensing statement.
 
 ## Tcl/Tk caveat
 

@@ -13,6 +13,24 @@
     stops on any mismatch instead of upgrading or downgrading anything. It never
     deletes an existing output directory.
 
+    After PyInstaller finishes, the script prunes the unused OpenCV FFmpeg
+    videoio plugin (opencv_videoio_ffmpeg*.dll) from the bundle. This project
+    performs no video I/O; OpenCV is used only for image / geometry work (e.g.
+    cv2.warpPolar for the Spiral renderer). See packaging/README.md and the R1A
+    record in the packaging notes.
+
+    The script also hardens its own DLL dependency resolution: it derives
+    <env>\Library\bin from the build interpreter's sys.prefix and prepends that
+    directory to this process's PATH for the duration of the version probes and
+    the PyInstaller run. Conda keeps several Windows runtime DLLs (libcrypto /
+    libssl / libexpat / liblzma / libbz2 / ffi, and tcl86t / tk86t) only there,
+    and PyInstaller's binary dependency analysis resolves transitive DLLs via
+    the process PATH. Without this, a caller that had not already put
+    Library\bin on PATH would produce a bundle silently missing those DLLs.
+    The original PATH is always restored (try/finally), including on every
+    failure path. Nothing outside this process tree is modified: no user PATH,
+    no machine PATH, no registry, no Conda config, no persisted variables.
+
     Both the repository root and the build environment root are derived at
     runtime -- no machine-specific paths are hardcoded.
 
@@ -59,6 +77,30 @@ function Write-Step {
 function Write-Ok {
     param([string]$Message)
     Write-Host "    OK  $Message" -ForegroundColor Green
+}
+
+function Join-PathList {
+    param(
+        [string]$First,
+        [AllowEmptyString()][string]$Second
+    )
+    if ([string]::IsNullOrEmpty($Second)) { return $First }
+    return ($First.TrimEnd('\', '/') + [System.IO.Path]::PathSeparator + $Second)
+}
+
+function Test-PathContainsDir {
+    param(
+        [string]$PathList,
+        [string]$Directory
+    )
+    if ([string]::IsNullOrEmpty($PathList)) { return $false }
+    $target = $Directory.TrimEnd('\', '/')
+    foreach ($entry in ($PathList -split [regex]::Escape([string][System.IO.Path]::PathSeparator))) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $e = $entry.Trim().Trim('"').TrimEnd('\', '/')
+        if ($e.Equals($target, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 # --------------------------------------------------------------------------
@@ -108,205 +150,367 @@ Write-Ok "interpreter : $PythonExe"
 Write-Ok "env prefix  : $EnvPrefix"
 
 # --------------------------------------------------------------------------
-# 3. Verify build environment versions.
+# 2b. Harden Conda DLL dependency resolution (PATH, this process only).
+#
+# Conda keeps the Windows runtime DLLs that Python extension modules link
+# against in <env>\Library\bin rather than next to the extension modules.
+# PyInstaller resolves *transitive* DLL dependencies of collected binaries
+# through the running process's PATH, so if the caller had not already put
+# Library\bin there, the bundle silently ends up missing them.
+#
+# The script therefore prepends Library\bin to its own process PATH before any
+# probe or build step that imports a runtime package (tkinter, numpy, PIL,
+# cv2, ...). Scope is strictly this process and its children.
 # --------------------------------------------------------------------------
-Write-Step 'Verifying build environment versions'
+Write-Step 'Hardening Conda DLL dependency resolution'
 
-# Write the probe to a temporary .py file rather than passing it via
-# `python -c`. PowerShell does not preserve multi-token quoting reliably when
-# forwarding arguments to native executables, so a file is the robust option.
-$ProbeLines = @(
-    'import sys'
-    'import importlib.metadata as md'
-    ''
-    'def ver(name):'
-    '    try:'
-    '        return md.version(name)'
-    '    except Exception:'
-    '        return ""'
-    ''
-    'print("python", sys.version.split()[0])'
-    'print("pyinstaller", ver("pyinstaller"))'
-    'print("pyinstaller-hooks-contrib", ver("pyinstaller-hooks-contrib"))'
-    'print("numpy", ver("numpy"))'
-    'print("Pillow", ver("Pillow"))'
-    'print("opencv-python-headless", ver("opencv-python-headless"))'
-)
-$ProbeFile = Join-Path ([System.IO.Path]::GetTempPath()) ("halftone_env_probe_{0}.py" -f ([System.Guid]::NewGuid().ToString('N')))
+$OriginalPath    = $env:PATH
+$CondaLibraryBin = Join-Path $EnvPrefix 'Library\bin'
 
-try {
-    Set-Content -LiteralPath $ProbeFile -Value $ProbeLines -Encoding UTF8
-    $ProbeOut = & $PythonExe $ProbeFile
-    $ProbeExit = $LASTEXITCODE
-} finally {
-    if (Test-Path $ProbeFile) { Remove-Item -LiteralPath $ProbeFile -Force -ErrorAction SilentlyContinue }
+if (-not (Test-Path -LiteralPath $CondaLibraryBin -PathType Container)) {
+    Stop-Fail "Derived Conda library directory does not exist: '$CondaLibraryBin'. Expected '<env prefix>\Library\bin'."
 }
+Write-Ok "conda library bin : $CondaLibraryBin"
 
-if ($ProbeExit -ne 0) {
-    Stop-Fail "Version probe failed to run under '$PythonExe'."
-}
-
-$Vers = @{}
-foreach ($line in $ProbeOut) {
-    $parts = $line -split ' ', 2
-    if ($parts.Count -eq 2) { $Vers[$parts[0].Trim()] = $parts[1].Trim() }
-}
-
-$Checks = @(
-    @{ Name = 'python';                  Actual = $Vers['python'];                  Expected = $ExpectedPython },
-    @{ Name = 'pyinstaller';             Actual = $Vers['pyinstaller'];             Expected = $ExpectedPyInstaller },
-    @{ Name = 'pyinstaller-hooks-contrib'; Actual = $Vers['pyinstaller-hooks-contrib']; Expected = $ExpectedHooksContrib },
-    @{ Name = 'numpy';                   Actual = $Vers['numpy'];                   Expected = $ExpectedNumpy },
-    @{ Name = 'Pillow';                  Actual = $Vers['Pillow'];                  Expected = $ExpectedPillow },
-    @{ Name = 'opencv-python-headless';  Actual = $Vers['opencv-python-headless'];  Expected = $ExpectedOpenCv }
-)
-
-$Mismatch = @()
-foreach ($c in $Checks) {
-    if ($c.Actual -ne $c.Expected) {
-        $Mismatch += ("  {0,-26} expected {1,-12} found {2}" -f $c.Name, $c.Expected, ($(if ($c.Actual) { $c.Actual } else { '<missing>' })))
-    } else {
-        Write-Ok ("{0,-26} {1}" -f $c.Name, $c.Actual)
-    }
-}
-if ($Mismatch.Count -gt 0) {
-    Write-Host ''
-    Write-Host 'Environment version mismatches:' -ForegroundColor Yellow
-    $Mismatch | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
-    Stop-Fail 'Build environment does not match the frozen toolchain. Nothing was installed or changed.'
-}
-
-# --------------------------------------------------------------------------
-# 4. Verify the Tcl/Tk shared libraries that the default hooks miss.
-# --------------------------------------------------------------------------
-Write-Step 'Verifying Tcl/Tk runtime DLLs in the build environment'
-
-$TclDll = Join-Path $EnvPrefix 'Library\bin\tcl86t.dll'
-$TkDll  = Join-Path $EnvPrefix 'Library\bin\tk86t.dll'
-
-foreach ($dll in @(
-        @{ Path = $TclDll; Label = 'tcl86t.dll' },
-        @{ Path = $TkDll;  Label = 'tk86t.dll'  })) {
-    if (-not (Test-Path $dll.Path)) {
-        Stop-Fail "Required DLL missing: $($dll.Label) (expected at '$($dll.Path)')."
-    }
-    Write-Ok "$($dll.Label) -> $($dll.Path)"
-}
-
-# --------------------------------------------------------------------------
-# 5. Validate OutputRoot: outside the repo, new or empty.
-# --------------------------------------------------------------------------
-Write-Step 'Validating output root'
-
-$OutputRootFull = [System.IO.Path]::GetFullPath($OutputRoot)
-
-$RepoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
-$OutFull  = $OutputRootFull.TrimEnd('\', '/')
-
-$repoWithSep = $RepoFull + [System.IO.Path]::DirectorySeparatorChar
-if ($OutFull -eq $RepoFull -or $OutFull.StartsWith($repoWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
-    Stop-Fail "OutputRoot must be OUTSIDE the repository. Got: '$OutputRootFull'"
-}
-Write-Ok "outside repository: $OutputRootFull"
-
-if (Test-Path $OutputRootFull) {
-    $existing = @(Get-ChildItem -LiteralPath $OutputRootFull -Force -ErrorAction SilentlyContinue)
-    if ($existing.Count -gt 0) {
-        Stop-Fail "OutputRoot already exists and is not empty: '$OutputRootFull'. Refusing to touch it -- choose a new directory."
-    }
-    Write-Ok 'output root exists but is empty'
+$CallerHadLibraryBin = Test-PathContainsDir -PathList $OriginalPath -Directory $CondaLibraryBin
+if ($CallerHadLibraryBin) {
+    Write-Ok 'caller PATH already provided Library\bin (script does not depend on this)'
 } else {
-    Write-Ok 'output root does not exist yet'
+    Write-Ok 'caller PATH did NOT provide Library\bin -- script supplies it itself'
 }
 
-# --------------------------------------------------------------------------
-# 6. Create the dist / build / spec layout.
-# --------------------------------------------------------------------------
-$DistPath = Join-Path $OutputRootFull 'dist'
-$WorkPath = Join-Path $OutputRootFull 'build'
-$SpecPath = Join-Path $OutputRootFull 'spec'
+$env:PATH = Join-PathList -First $CondaLibraryBin -Second $OriginalPath
+Write-Ok "process PATH hardened for this build (restored automatically at the end)"
 
-Write-Step 'Creating output layout'
-foreach ($p in @($OutputRootFull, $DistPath, $WorkPath, $SpecPath)) {
-    if (-not (Test-Path $p)) {
-        New-Item -ItemType Directory -Path $p -Force | Out-Null
+# --------------------------------------------------------------------------
+# Everything from here on runs with the hardened PATH. The matching finally
+# block restores the original PATH on every exit path: success, version
+# mismatch, probe failure, PyInstaller failure, Tcl/Tk verification failure,
+# FFmpeg prune mismatch, or post-build verification failure.
+# --------------------------------------------------------------------------
+try {
+
+    # --------------------------------------------------------------------------
+    # 3. Verify build environment versions.
+    # --------------------------------------------------------------------------
+    Write-Step 'Verifying build environment versions'
+
+    # Write the probe to a temporary .py file rather than passing it via
+    # `python -c`. PowerShell does not preserve multi-token quoting reliably when
+    # forwarding arguments to native executables, so a file is the robust option.
+    $ProbeLines = @(
+        'import sys'
+        'import importlib.metadata as md'
+        ''
+        'def ver(name):'
+        '    try:'
+        '        return md.version(name)'
+        '    except Exception:'
+        '        return ""'
+        ''
+        'print("python", sys.version.split()[0])'
+        'print("pyinstaller", ver("pyinstaller"))'
+        'print("pyinstaller-hooks-contrib", ver("pyinstaller-hooks-contrib"))'
+        'print("numpy", ver("numpy"))'
+        'print("Pillow", ver("Pillow"))'
+        'print("opencv-python-headless", ver("opencv-python-headless"))'
+    )
+    $ProbeFile = Join-Path ([System.IO.Path]::GetTempPath()) ("halftone_env_probe_{0}.py" -f ([System.Guid]::NewGuid().ToString('N')))
+
+    try {
+        Set-Content -LiteralPath $ProbeFile -Value $ProbeLines -Encoding UTF8
+        $ProbeOut = & $PythonExe $ProbeFile
+        $ProbeExit = $LASTEXITCODE
+    } finally {
+        if (Test-Path $ProbeFile) { Remove-Item -LiteralPath $ProbeFile -Force -ErrorAction SilentlyContinue }
     }
-    Write-Ok $p
+
+    if ($ProbeExit -ne 0) {
+        Stop-Fail "Version probe failed to run under '$PythonExe'."
+    }
+
+    $Vers = @{}
+    foreach ($line in $ProbeOut) {
+        $parts = $line -split ' ', 2
+        if ($parts.Count -eq 2) { $Vers[$parts[0].Trim()] = $parts[1].Trim() }
+    }
+
+    $Checks = @(
+        @{ Name = 'python';                  Actual = $Vers['python'];                  Expected = $ExpectedPython },
+        @{ Name = 'pyinstaller';             Actual = $Vers['pyinstaller'];             Expected = $ExpectedPyInstaller },
+        @{ Name = 'pyinstaller-hooks-contrib'; Actual = $Vers['pyinstaller-hooks-contrib']; Expected = $ExpectedHooksContrib },
+        @{ Name = 'numpy';                   Actual = $Vers['numpy'];                   Expected = $ExpectedNumpy },
+        @{ Name = 'Pillow';                  Actual = $Vers['Pillow'];                  Expected = $ExpectedPillow },
+        @{ Name = 'opencv-python-headless';  Actual = $Vers['opencv-python-headless'];  Expected = $ExpectedOpenCv }
+    )
+
+    $Mismatch = @()
+    foreach ($c in $Checks) {
+        if ($c.Actual -ne $c.Expected) {
+            $Mismatch += ("  {0,-26} expected {1,-12} found {2}" -f $c.Name, $c.Expected, ($(if ($c.Actual) { $c.Actual } else { '<missing>' })))
+        } else {
+            Write-Ok ("{0,-26} {1}" -f $c.Name, $c.Actual)
+        }
+    }
+    if ($Mismatch.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Environment version mismatches:' -ForegroundColor Yellow
+        $Mismatch | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+        Stop-Fail 'Build environment does not match the frozen toolchain. Nothing was installed or changed.'
+    }
+
+    # --------------------------------------------------------------------------
+    # 4. Verify the Tcl/Tk shared libraries that the default hooks miss.
+    # --------------------------------------------------------------------------
+    Write-Step 'Verifying Tcl/Tk runtime DLLs in the build environment'
+
+    $TclDll = Join-Path $EnvPrefix 'Library\bin\tcl86t.dll'
+    $TkDll  = Join-Path $EnvPrefix 'Library\bin\tk86t.dll'
+
+    foreach ($dll in @(
+            @{ Path = $TclDll; Label = 'tcl86t.dll' },
+            @{ Path = $TkDll;  Label = 'tk86t.dll'  })) {
+        if (-not (Test-Path $dll.Path)) {
+            Stop-Fail "Required DLL missing: $($dll.Label) (expected at '$($dll.Path)')."
+        }
+        Write-Ok "$($dll.Label) -> $($dll.Path)"
+    }
+
+    # --------------------------------------------------------------------------
+    # 5. Validate OutputRoot: outside the repo, new or empty.
+    # --------------------------------------------------------------------------
+    Write-Step 'Validating output root'
+
+    $OutputRootFull = [System.IO.Path]::GetFullPath($OutputRoot)
+
+    $RepoFull = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+    $OutFull  = $OutputRootFull.TrimEnd('\', '/')
+
+    $repoWithSep = $RepoFull + [System.IO.Path]::DirectorySeparatorChar
+    if ($OutFull -eq $RepoFull -or $OutFull.StartsWith($repoWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Stop-Fail "OutputRoot must be OUTSIDE the repository. Got: '$OutputRootFull'"
+    }
+    Write-Ok "outside repository: $OutputRootFull"
+
+    if (Test-Path $OutputRootFull) {
+        $existing = @(Get-ChildItem -LiteralPath $OutputRootFull -Force -ErrorAction SilentlyContinue)
+        if ($existing.Count -gt 0) {
+            Stop-Fail "OutputRoot already exists and is not empty: '$OutputRootFull'. Refusing to touch it -- choose a new directory."
+        }
+        Write-Ok 'output root exists but is empty'
+    } else {
+        Write-Ok 'output root does not exist yet'
+    }
+
+    # --------------------------------------------------------------------------
+    # 6. Create the dist / build / spec layout.
+    # --------------------------------------------------------------------------
+    $DistPath = Join-Path $OutputRootFull 'dist'
+    $WorkPath = Join-Path $OutputRootFull 'build'
+    $SpecPath = Join-Path $OutputRootFull 'spec'
+
+    Write-Step 'Creating output layout'
+    foreach ($p in @($OutputRootFull, $DistPath, $WorkPath, $SpecPath)) {
+        if (-not (Test-Path $p)) {
+            New-Item -ItemType Directory -Path $p -Force | Out-Null
+        }
+        Write-Ok $p
+    }
+
+    # --------------------------------------------------------------------------
+    # 7. Invoke PyInstaller with the frozen parameter set.
+    # --------------------------------------------------------------------------
+    Write-Step 'Running PyInstaller'
+
+    $SrcPath = Join-Path $RepoRoot 'src'
+
+    $PyInstallerArgs = @(
+        '-m', 'PyInstaller'
+        '--noconfirm'
+        '--onedir'
+        '--windowed'
+        '--name', 'HalftonePlayground'
+        '--contents-directory', '_internal'
+        '--paths', $SrcPath
+        '--distpath', $DistPath
+        '--workpath', $WorkPath
+        '--specpath', $SpecPath
+        '--add-binary', "$TclDll;."
+        '--add-binary', "$TkDll;."
+        $EntryScript
+    )
+
+    Write-Host ''
+    Write-Host "    $PythonExe $($PyInstallerArgs -join ' ')" -ForegroundColor DarkGray
+    Write-Host ''
+
+    & $PythonExe @PyInstallerArgs
+    $PyInstallerExit = $LASTEXITCODE
+
+    if ($PyInstallerExit -ne 0) {
+        Stop-Fail "PyInstaller exited with code $PyInstallerExit."
+    }
+    Write-Ok "PyInstaller exit code: $PyInstallerExit"
+
+    # --------------------------------------------------------------------------
+    # 8. Verify the produced bundle.
+    # --------------------------------------------------------------------------
+    Write-Step 'Verifying build output'
+
+    $BundleDir = Join-Path $DistPath 'HalftonePlayground'
+    $ExePath   = Join-Path $BundleDir 'HalftonePlayground.exe'
+    $Internal  = Join-Path $BundleDir '_internal'
+
+    if (-not (Test-Path $ExePath)) {
+        Stop-Fail "Expected EXE not found: '$ExePath'"
+    }
+    if (-not (Test-Path $Internal)) {
+        Stop-Fail "Expected _internal directory not found: '$Internal'"
+    }
+    Write-Ok "EXE         : $ExePath"
+    Write-Ok "_internal   : $Internal"
+
+    foreach ($dll in @('tcl86t.dll', 'tk86t.dll', '_tkinter.pyd')) {
+        $p = Join-Path $Internal $dll
+        if (-not (Test-Path $p)) {
+            Stop-Fail "Expected Tcl/Tk runtime file missing from bundle: '$p'"
+        }
+        Write-Ok "tcl/tk      : $dll"
+    }
+
+    # Required runtime binaries that must be present in a complete bundle.
+    foreach ($rel in @('cv2\cv2.pyd', 'numpy', 'PIL')) {
+        $p = Join-Path $Internal $rel
+        if (-not (Test-Path $p)) {
+            Stop-Fail "Expected runtime artifact missing from bundle: '$p'"
+        }
+        Write-Ok "runtime     : $rel"
+    }
+
+    # --------------------------------------------------------------------------
+    # 8a-2. Verify Conda Library\bin transitive runtime DLLs were auto-collected.
+    #
+    # These six DLLs are real dependencies of the frozen Python runtime extension
+    # modules (_bz2, _ctypes, _ssl, pyexpat, _lzma):
+    #
+    #     LIBBZ2.dll, ffi.dll, libcrypto-3-x64.dll, libexpat.dll,
+    #     liblzma.dll, libssl-3-x64.dll
+    #
+    # They live in <env>\Library\bin and are resolved by PyInstaller's normal
+    # binary dependency analysis via the process PATH. They must NOT be added with
+    # a dedicated --add-binary: the whole point of the PATH hardening above is that
+    # ordinary analysis finds them by itself. Presence here is the gate that proves
+    # a caller without Library\bin on PATH still gets a complete bundle.
+    # --------------------------------------------------------------------------
+    Write-Step 'Verifying Conda Library\bin transitive runtime DLLs in the bundle'
+
+    $TransitiveDlls = @(
+        'LIBBZ2.dll'
+        'ffi.dll'
+        'libcrypto-3-x64.dll'
+        'libexpat.dll'
+        'liblzma.dll'
+        'libssl-3-x64.dll'
+    )
+
+    foreach ($dll in $TransitiveDlls) {
+        $p = Join-Path $Internal $dll
+        if (-not (Test-Path -LiteralPath $p)) {
+            Stop-Fail "Expected Conda transitive runtime DLL missing from bundle: '$dll' (looked at '$p'). PyInstaller dependency analysis did not resolve Library\bin -- the bundle would be incomplete on a machine without Conda."
+        }
+        Write-Ok "transitive  : $dll"
+    }
+
+    # --------------------------------------------------------------------------
+    # 8b. Prune the unused OpenCV FFmpeg videoio plugin.
+    #
+    # opencv-python-headless (frozen at $ExpectedOpenCv) ships a runtime-loaded
+    # videoio plugin, opencv_videoio_ffmpeg*.dll, under _internal\cv2\. This
+    # project does no video read/write; OpenCV is used only for image / geometry
+    # work (e.g. cv2.warpPolar for the Spiral renderer). Human functional
+    # acceptance (R1A) confirmed the GUI and every image path -- including Spiral
+    # Variable / Spiral Fixed and Spiral PNG export -- operate correctly without
+    # this plugin. The frozen toolchain is expected to produce exactly ONE match;
+    # any other count means the release bundling changed and must be re-audited.
+    # --------------------------------------------------------------------------
+    Write-Step 'Pruning unused OpenCV FFmpeg videoio plugin'
+
+    $Cv2Dir = Join-Path $Internal 'cv2'
+
+    $FfmpegMatches = @()
+    if (Test-Path $Cv2Dir) {
+        $FfmpegMatches = @(Get-ChildItem -LiteralPath $Cv2Dir -Filter 'opencv_videoio_ffmpeg*.dll' -File -ErrorAction SilentlyContinue)
+    }
+
+    if ($FfmpegMatches.Count -ne 1) {
+        Write-Host ''
+        Write-Host "Found $($FfmpegMatches.Count) match(es) for opencv_videoio_ffmpeg*.dll under '$Cv2Dir':" -ForegroundColor Yellow
+        $FfmpegMatches | ForEach-Object { Write-Host "    $($_.FullName)" -ForegroundColor Yellow }
+        Stop-Fail ("Expected exactly 1 OpenCV FFmpeg videoio plugin for the frozen toolchain (opencv-python-headless $ExpectedOpenCv). Got $($FfmpegMatches.Count). The release bundle changed -- re-audit before trusting the prune.")
+    }
+
+    $FfmpegPlugin    = $FfmpegMatches[0]
+    $FfmpegPath      = $FfmpegPlugin.FullName
+    $FfmpegRelPath   = $FfmpegPath.Substring($BundleDir.Length).TrimStart('\', '/')
+    $FfmpegSize      = $FfmpegPlugin.Length
+    $FfmpegHash      = (Get-FileHash -LiteralPath $FfmpegPath -Algorithm SHA256).Hash
+
+    Remove-Item -LiteralPath $FfmpegPath -Force
+
+    $FfmpegAfter = @()
+    if (Test-Path $Cv2Dir) {
+        $FfmpegAfter = @(Get-ChildItem -LiteralPath $Cv2Dir -Filter 'opencv_videoio_ffmpeg*.dll' -File -ErrorAction SilentlyContinue)
+    }
+    if ($FfmpegAfter.Count -ne 0) {
+        Stop-Fail "FFmpeg videoio plugin still present after deletion (count $($FfmpegAfter.Count)). Build FAIL."
+    }
+
+    Write-Host ''
+    Write-Host 'Pruned unused OpenCV FFmpeg videoio plugin:' -ForegroundColor Cyan
+    Write-Host "    path   : $FfmpegRelPath"
+    Write-Host "    size   : $FfmpegSize bytes"
+    Write-Host "    SHA256 : $FfmpegHash"
+    Write-Host ''
+    Write-Host '    Rationale: this project performs no OpenCV videoio / FFmpeg video'
+    Write-Host '    read or write. Human functional acceptance (R1A) verified the GUI'
+    Write-Host '    and all image paths -- including Spiral (cv2.warpPolar) and Spiral'
+    Write-Host '    PNG export -- operate correctly without this runtime plugin.'
+    Write-Host ''
+
+    # --------------------------------------------------------------------------
+    # 9. Final bundle metrics (post-prune) and report.
+    # --------------------------------------------------------------------------
+    $ExeHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash
+
+    $SizeBytes = 0
+    Get-ChildItem -LiteralPath $BundleDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { $SizeBytes += $_.Length }
+    $SizeMb = [math]::Round($SizeBytes / 1MB, 1)
+
+    # --------------------------------------------------------------------------
+    # 10. Report.
+    # --------------------------------------------------------------------------
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host ' BUILD COMPLETE' -ForegroundColor Green
+    Write-Host '============================================================' -ForegroundColor Green
+    Write-Host " candidate path : $BundleDir"
+    Write-Host " exe path       : $ExePath"
+    Write-Host " exe SHA-256    : $ExeHash"
+    Write-Host " onedir size    : $SizeMb MB ($SizeBytes bytes)"
+    Write-Host " pruned plugin  : $FfmpegRelPath ($FfmpegSize bytes)"
+    Write-Host ''
+    Write-Host ' The bundle has not been archived. No ZIP was created.'
+    Write-Host ''
+
+} finally {
+    # ----------------------------------------------------------------------
+    # Restore the caller's PATH. Runs on success and on every failure path.
+    # Only this process and its children ever saw the hardened PATH.
+    # ----------------------------------------------------------------------
+    $env:PATH = $OriginalPath
+    Write-Host ''
+    Write-Host "==> Restored original process PATH (Library\bin hardening removed)" -ForegroundColor Cyan
 }
-
-# --------------------------------------------------------------------------
-# 7. Invoke PyInstaller with the frozen parameter set.
-# --------------------------------------------------------------------------
-Write-Step 'Running PyInstaller'
-
-$SrcPath = Join-Path $RepoRoot 'src'
-
-$PyInstallerArgs = @(
-    '-m', 'PyInstaller'
-    '--noconfirm'
-    '--onedir'
-    '--windowed'
-    '--name', 'HalftonePlayground'
-    '--contents-directory', '_internal'
-    '--paths', $SrcPath
-    '--distpath', $DistPath
-    '--workpath', $WorkPath
-    '--specpath', $SpecPath
-    '--add-binary', "$TclDll;."
-    '--add-binary', "$TkDll;."
-    $EntryScript
-)
-
-Write-Host ''
-Write-Host "    $PythonExe $($PyInstallerArgs -join ' ')" -ForegroundColor DarkGray
-Write-Host ''
-
-& $PythonExe @PyInstallerArgs
-$PyInstallerExit = $LASTEXITCODE
-
-if ($PyInstallerExit -ne 0) {
-    Stop-Fail "PyInstaller exited with code $PyInstallerExit."
-}
-Write-Ok "PyInstaller exit code: $PyInstallerExit"
-
-# --------------------------------------------------------------------------
-# 8. Verify the produced bundle.
-# --------------------------------------------------------------------------
-Write-Step 'Verifying build output'
-
-$BundleDir = Join-Path $DistPath 'HalftonePlayground'
-$ExePath   = Join-Path $BundleDir 'HalftonePlayground.exe'
-$Internal  = Join-Path $BundleDir '_internal'
-
-if (-not (Test-Path $ExePath)) {
-    Stop-Fail "Expected EXE not found: '$ExePath'"
-}
-if (-not (Test-Path $Internal)) {
-    Stop-Fail "Expected _internal directory not found: '$Internal'"
-}
-Write-Ok "EXE         : $ExePath"
-Write-Ok "_internal   : $Internal"
-
-$ExeHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash
-
-$SizeBytes = 0
-Get-ChildItem -LiteralPath $BundleDir -Recurse -File -Force -ErrorAction SilentlyContinue |
-    ForEach-Object { $SizeBytes += $_.Length }
-$SizeMb = [math]::Round($SizeBytes / 1MB, 1)
-
-# --------------------------------------------------------------------------
-# 9. Report.
-# --------------------------------------------------------------------------
-Write-Host ''
-Write-Host '============================================================' -ForegroundColor Green
-Write-Host ' BUILD COMPLETE' -ForegroundColor Green
-Write-Host '============================================================' -ForegroundColor Green
-Write-Host " candidate path : $BundleDir"
-Write-Host " exe path       : $ExePath"
-Write-Host " exe SHA-256    : $ExeHash"
-Write-Host " onedir size    : $SizeMb MB ($SizeBytes bytes)"
-Write-Host ''
-Write-Host ' The bundle has not been archived. No ZIP was created.'
-Write-Host ''
 
 exit 0
