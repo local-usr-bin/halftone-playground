@@ -507,6 +507,47 @@ What this round deliberately does **not** do (later rounds):
 The frozen GUI decisions (layout, state model, boundaries, stage order) live in
 [`docs/GUI_ROUND0_DECISIONS.md`](docs/GUI_ROUND0_DECISIONS.md).
 
+## Running the Preview (Windows)
+
+A self-contained Windows preview binary is packaged for **Windows 10 / 11
+x64**. It needs **no Python, no Conda and no pip** — everything it uses is
+inside the release folder.
+
+To run it:
+
+1. Download the preview ZIP
+   (`HalftonePlayground-Preview-0.0.1-win64.zip`).
+2. **Extract the whole folder** (right-click → Extract All, or any unzip
+   tool). Do not run the EXE from inside the ZIP viewer.
+3. Double-click **`HalftonePlayground.exe`** inside the extracted
+   `HalftonePlayground-Preview-0.0.1-win64\` folder.
+
+Keep the folder intact: `HalftonePlayground.exe` needs the sibling
+`_internal\` directory. **Do not copy the EXE out on its own** — the program
+will not start without `_internal\`.
+
+### Basic GUI flow
+
+1. **Open Image…** — load a PNG / JPEG (anything Pillow can read).
+2. Pick a mode: **Stripe** or **Spiral**.
+3. Pick a width mode: **Variable** (grayscale-driven) or **Fixed**.
+4. Adjust the **Render** options and parameters.
+5. **Generate** — renders the full-resolution result on a background worker.
+6. **Save PNG…** — writes the stored full-resolution result.
+
+### Result Preview is a display-scaled preview
+
+The on-screen **Result Preview** is a **display-scaled** preview, not the
+final pixels. For very fine / high-frequency line textures it can show
+visual artefacts — individual thin lines appearing to vanish, broken or
+dashed lines, aliasing, moiré, or small density differences between the
+preview and the saved file.
+
+The **saved full-resolution PNG is the authoritative output**. Judge the
+result from the saved file, not from the on-screen preview. This is an
+**accepted limitation** of the scaled preview and is not a renderer or
+geometry bug.
+
 ## Layout
 
 - `src/halftone_playground/` — package code (`stripe.py` and `spiral.py`

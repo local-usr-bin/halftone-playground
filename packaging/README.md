@@ -36,6 +36,91 @@ python -m pip install -r packaging/requirements-build.txt
 and opencv-python-headless are application/runtime dependencies that come from
 the cloned environment — they are intentionally not listed there.
 
+## Release assembly
+
+There are **two** scripts, with a strict division of labour. Only
+`build_windows.ps1` ever invokes PyInstaller; `assemble_preview.ps1` never
+duplicates the PyInstaller command line.
+
+### 1. `build_windows.ps1` — the hardened / pruned onedir runtime
+
+Produces the frozen runtime bundle:
+
+```
+<OutputRoot>\dist\HalftonePlayground\
+├─ HalftonePlayground.exe
+└─ _internal\
+```
+
+It is the **only** production runtime build entry point, and it is where the
+onedir / windowed settings, the Tcl/Tk DLL fix, the Conda PATH hardening, the
+six transitive DLL resolution and the OpenCV FFmpeg prune all live. See
+**Building** above for the full behaviour.
+
+### 2. `assemble_preview.ps1` — the full Preview candidate
+
+Turns a clean source checkout into a distributable Preview ZIP. Run it from an
+activated build environment:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\packaging\assemble_preview.ps1 `
+    -OutputRoot "<a new directory outside the repository>"
+```
+
+`-OutputRoot` must be **outside** the repository and either **new or empty**;
+the script refuses to touch a non-empty directory (it never recursively deletes
+old assembly output). The script derives the repository root from its own
+location — no machine-specific paths are baked in.
+
+It will:
+
+1. **call `packaging/build_windows.ps1`** with an isolated build directory
+   (`<OutputRoot>\build`) as the build output root — a non-zero build exit makes
+   the assembly FAIL immediately;
+2. assemble the release folder from the build output plus the repository's
+   current `README.md`, `LICENSE`, `THIRD-PARTY-NOTICES.txt` and `licenses\`;
+3. run the **legal-docs gate** and the **runtime gate** (see below);
+4. create the ZIP with `System.IO.Compression.ZipFile` (no external 7-Zip
+   dependency), with the release folder as the ZIP's single top-level entry;
+5. **extract the ZIP again** into a `verify\` directory and re-check the same
+   gates — a round-trip verification of the artifact that actually ships;
+6. write `SHA256SUMS.txt` next to the ZIP.
+
+Output layout:
+
+```
+<OutputRoot>\
+├─ build\      build_windows.ps1 output (dist / build / spec)
+├─ stage\      the release folder used for ZIP staging
+├─ artifacts\  the ZIP + SHA256SUMS.txt
+└─ verify\     the ZIP extracted again for round-trip verification
+```
+
+The staged release folder (and therefore the ZIP root) contains exactly:
+
+```
+HalftonePlayground-Preview-0.0.1-win64\
+├─ HalftonePlayground.exe
+├─ _internal\
+├─ README.md
+├─ LICENSE
+├─ THIRD-PARTY-NOTICES.txt
+└─ licenses\
+```
+
+`SHA256SUMS.txt` is a **sidecar** file: it is not placed inside the ZIP.
+
+### What `assemble_preview.ps1` does NOT do
+
+The assembly script deliberately stops at the artifact. It does **not**:
+
+- create a Git tag,
+- create a GitHub Release,
+- `push`,
+- sign the binaries.
+
+Those steps, if ever wanted, are separate and explicit.
+
 ## Building
 
 From an activated build environment, run:
