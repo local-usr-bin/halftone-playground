@@ -27,3 +27,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# The GUI *shell* tests drive a real Tk widget tree, so they are opt-in: they
+# need a display (or Xvfb) and they pull ``tkinter`` into ``sys.modules``,
+# which the headless smoke guard (``test_no_gui_toolkits_loaded``) rightly
+# forbids in the default run.  The toolkit-free GUI *logic* tests
+# (params / state / imageutil) are normal tests and always run.
+addopts = "-m 'not gui'"
+markers = [
+    "gui: GUI shell tests that require a real Tk display or Xvfb (opt-in via -m gui)",
+]

@@ -44,8 +44,17 @@ the Cartesian source image, via the existing
 (and `python -m halftone_playground`) wires the existing cores and renderers
 into a single-image tool. See the [CLI](#cli) section below.
 
-There is no GUI. Not implemented yet: transparency / alpha, custom RGB
-backgrounds, non-square Spiral input, batch processing.
+**A first GUI shell is implemented (GUI-001).** A plain Tkinter/ttk window
+(Controls on the left, Source / Result previews on the right) can open an
+image, show a source preview and validate parameters. `Generate` and
+`Save PNG…` are present but **disabled**: the real generation pipeline is a
+later round. The GUI accepts a rectangular source for Spiral and projects the
+centered maximum square it will use (see the [GUI](#gui) section below). See
+[`docs/GUI_ROUND0_DECISIONS.md`](docs/GUI_ROUND0_DECISIONS.md) for the frozen
+GUI decisions.
+
+Not implemented yet: the GUI generation / save pipeline, transparency / alpha,
+custom RGB backgrounds, batch processing.
 
 ## Stripe parameters
 
@@ -404,14 +413,56 @@ Output: 666x666
 | `1` | Runtime failure (reading / decoding the input, writing the output). |
 | `2` | Usage or validation failure (bad arguments, non-PNG output, non-square spiral input, output would overwrite the input, ...). argparse's own parse errors also exit `2`. |
 
+## GUI
+
+A first GUI shell ships as **GUI-001**. It is a thin entry point **parallel**
+to the CLI and calls the same Python APIs directly — it never shells out to the
+CLI and never reimplements geometry.
+
+Launch it as a module (from a source checkout with `PYTHONPATH=src`, or after
+`pip install .`):
+
+```bash
+python -m halftone_playground.gui
+```
+
+What GUI-001 does:
+
+- a plain ttk window: **Controls** on the left, a horizontal **Source Preview |
+  Result Preview** pair on the right, an inline status strip at the bottom;
+- `Open Image…` loads a single-frame raster (PNG / JPEG and anything else
+  Pillow can read), shows the filename, the source `W × H`, a source preview
+  (aspect-preserving, never cropped or stretched) and the projected output
+  resolution;
+- mode / width-mode / render controls, with Stripe↔Spiral and Variable↔Fixed
+  parameter visibility that **never resets hidden values**;
+- inline validation reusing the core contracts (`Scale` positive finite,
+  `Period` / `Arms` positive integers, `1 ≤ Line width ≤ Period`);
+- a **rectangular source is legal in Spiral mode**. The GUI takes the centered
+  maximum square (`side = min(W, H)`) automatically, before any scale. The
+  Source Preview still shows the complete original image, and the Output
+  readout projects a square for Spiral while Stripe keeps the source aspect
+  ratio. There is no manual crop UI and no crop editor.
+
+What GUI-001 deliberately does **not** do (later rounds):
+
+- `Generate` and `Save PNG…` are present but **disabled** — there is no
+  generation pipeline, worker, cancel or save yet;
+- no packaging, no installer, no portable build.
+
+The frozen GUI decisions (layout, state model, boundaries, stage order) live in
+[`docs/GUI_ROUND0_DECISIONS.md`](docs/GUI_ROUND0_DECISIONS.md).
+
 ## Layout
 
 - `src/halftone_playground/` — package code (`stripe.py` and `spiral.py`
   geometry, `preprocess.py` scaling, `render.py` output, `cli.py` command line)
+- `src/halftone_playground/gui/` — the Tk/ttk GUI shell (`params.py` /
+  `state.py` / `imageutil.py` are toolkit-free logic; `app.py` is the widgets)
 - `tests/` — pytest suite
 - `scripts/` — small runnable helpers
 - `samples/` — generated example images
-- `docs/` — future design notes
+- `docs/` — decision records and design notes
 
 ## Dependencies
 
@@ -427,8 +478,20 @@ Run from the repository root:
 
 ```bash
 pip install pytest   # once, for the dev environment
-pytest               # full test suite
+pytest               # full headless test suite (GUI shell tests deselected)
 ```
+
+The default run is toolkit-free: it never imports `tkinter`. The GUI *shell*
+tests drive a real Tk widget tree, so they are opt-in and need a display (or
+`Xvfb`):
+
+```bash
+pytest -m gui                    # GUI shell tests, needs DISPLAY
+xvfb-run -a pytest -m gui        # ...or run them under a virtual display
+```
+
+The toolkit-free GUI *logic* tests (`params` / `state` / `imageutil`) are
+ordinary tests and always run.
 
 ## Sample images
 
