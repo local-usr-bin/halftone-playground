@@ -57,6 +57,23 @@ GUI decisions.
 Not implemented yet: transparency editing beyond the Spiral disc, custom RGB
 backgrounds, batch processing.
 
+![Halftone Playground examples](docs/images/demo-overview.png)
+
+Original image → Stripe → Spiral.
+
+## Download
+
+Current Preview: **Halftone Playground v0.0.1 Preview**
+
+- Windows 10 / Windows 11 x64
+- Portable ZIP — no Python, Conda or pip required
+
+Release page:
+<https://github.com/local-usr-bin/halftone-playground/releases/tag/v0.0.1-preview>
+
+Extract the entire ZIP and run `HalftonePlayground.exe`. Keep the `_internal`
+folder with the EXE — the program will not start without it.
+
 ## Stripe parameters
 
 - **`period`** — distance between adjacent stripe **centers**, in pixels of
@@ -221,6 +238,10 @@ out2 = render_source_color_on_white(sp, rgb)
 never links them. Scaling the canvas by `2.0` leaves `period` and `line_width`
 untouched, so if you want thickness to look identical after a scale you change
 `period` / `line_width` yourself.
+
+![Fixed-width spiral example](docs/images/demo-fixed-spiral.png)
+
+Fixed-width spiral example (white on black).
 
 ## Renderers and compositors
 
